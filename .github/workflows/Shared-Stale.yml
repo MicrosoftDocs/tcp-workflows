@@ -54,7 +54,7 @@ jobs:
  #       echo "SelectedMonth=$WorkflowFormattedMonthSelected" >> $env:GITHUB_OUTPUT
 
 
-    - uses: actions/stale@v9
+    - uses: actions/stale@v10
 #      if: endsWith(steps.get-month.outputs.SelectedMonth, 'Z') # Make sure there's a date before running otherwise the stale action will run as if start-date doesn't exist. 
       with:
         repo-token: ${{ secrets.AccessToken }} 
@@ -127,7 +127,7 @@ jobs:
 #     runs-on: ubuntu-latest
 #     if: github.repository_owner == 'MicrosoftDocs' && inputs.RepoVisibility == 'public'
 #     steps:
-#     - uses: actions/stale@v9
+#     - uses: actions/stale@v10
 #       with:
 #         repo-token: ${{ secrets.AccessToken }}
 #         debug-only: ${{ inputs.RunDebug }}
