@@ -41,13 +41,13 @@ jobs:
       steps:
         - name: Check out repo
           id: checkout-repo
-          uses: actions/checkout@v4
+          uses: actions/checkout@v5
           with:
             ref: ${{ fromJson(inputs.PayloadJson).event.pull_request.head.sha }}
         
         - name: Create App Token
           id: app-token
-          uses: actions/create-github-app-token@v1
+          uses: actions/create-github-app-token@v3
           with:
               app-id:      ${{ secrets.ClientId }}
               private-key: ${{ secrets.PrivateKey }}
