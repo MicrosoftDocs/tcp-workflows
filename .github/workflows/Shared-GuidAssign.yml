@@ -16,7 +16,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout main
-        uses: actions/checkout@v5
+        uses: actions/checkout@v4
         with:
           fetch-depth: 2
           token: ${{ secrets.AccessToken }}
@@ -29,20 +29,26 @@ jobs:
           if [ -z "$NEW_FILES" ]; then
             echo "No new articles in this push."
             echo "guid_changed=0" >> "$GITHUB_ENV"
+            echo "# GUID assignment report" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "No new or modified articles found in this push." >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
 
           CHANGED=0
+          SUMMARY_ROWS=""
           while IFS= read -r file; do
             # Skip files without frontmatter
             if ! head -1 "$file" | sed 's/^\xEF\xBB\xBF//' | tr -d '\r' | grep -q '^---$'; then
               echo "Skipping $file (no frontmatter)"
+              SUMMARY_ROWS="${SUMMARY_ROWS}| \`${file}\` | — | Skipped (no frontmatter) |\n"
               continue
             fi
 
             # Skip includes directory
             if echo "$file" | grep -q '/includes/'; then
               echo "Skipping $file (includes directory)"
+              SUMMARY_ROWS="${SUMMARY_ROWS}| \`${file}\` | — | Skipped (includes directory) |\n"
               continue
             fi
 
@@ -57,6 +63,7 @@ jobs:
               echo "Assigned GUID $NEW_UUID to $file (field was missing)"
               git add -- "$file"
               CHANGED=1
+              SUMMARY_ROWS="${SUMMARY_ROWS}| \`${file}\` | \`${NEW_UUID}\` | Assigned (field was missing) |\n"
             else
               # Field exists — check if value is empty
               GUID_VALUE=$(echo "$GUID_LINE" | sed 's/^[Aa][Ww][Aa]-[Aa][Rr][Tt][Ii][Cc][Ll][Ee][Gg][Uu][Ii][Dd]:[[:space:]]*//' | tr -d '[:space:]')
@@ -66,11 +73,20 @@ jobs:
                 echo "Assigned GUID $NEW_UUID to $file (field was empty)"
                 git add -- "$file"
                 CHANGED=1
+                SUMMARY_ROWS="${SUMMARY_ROWS}| \`${file}\` | \`${NEW_UUID}\` | Assigned (field was empty) |\n"
               else
                 echo "File $file already has GUID: $GUID_VALUE"
+                SUMMARY_ROWS="${SUMMARY_ROWS}| \`${file}\` | \`${GUID_VALUE}\` | Already assigned |\n"
               fi
             fi
           done <<< "$NEW_FILES"
+
+          # Write job summary
+          echo "# GUID assignment report" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| File | GUID | Status |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|------|------|--------|" >> "$GITHUB_STEP_SUMMARY"
+          echo -e "$SUMMARY_ROWS" >> "$GITHUB_STEP_SUMMARY"
 
           echo "guid_changed=$CHANGED" >> "$GITHUB_ENV"
 

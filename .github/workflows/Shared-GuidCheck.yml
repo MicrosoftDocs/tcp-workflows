@@ -1,4 +1,4 @@
-name: GUIDs in PR are unique
+name: GUID check
 
 permissions:
   pull-requests: write
@@ -11,12 +11,12 @@ on:
         required: true
 
 jobs:
-  check-duplicate-guids:
+  check-guids:
     if: github.repository_owner == 'MicrosoftDocs'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
           token: ${{ secrets.AccessToken }}
@@ -33,6 +33,9 @@ jobs:
           if [ -z "$CHANGED_FILES" ]; then
             echo "No markdown files changed in this PR."
             echo "has_guids=false" >> "$GITHUB_OUTPUT"
+            echo "# GUID check report" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "No markdown files added or modified in this PR." >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
 
@@ -59,6 +62,10 @@ jobs:
             echo ""
             echo "No GUIDs to check."
             echo "has_guids=false" >> "$GITHUB_OUTPUT"
+            echo "# GUID check report" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "No GUIDs to check. Files without GUIDs will be assigned on merge." >> "$GITHUB_STEP_SUMMARY"
+            rm -f "$PATTERN_FILE"
             exit 0
           fi
 
@@ -108,14 +115,157 @@ jobs:
             echo "$DUPES" > /tmp/dupes.txt
             echo "has_dupes=true" >> "$GITHUB_OUTPUT"
             echo "::error::Duplicate awa-articleGuid values found in this PR!"
+
+            # Write job summary for duplicates
+            echo "# GUID check report" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "## Duplicate GUIDs" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "**Duplicate GUIDs found.** The following GUIDs appear in multiple files:" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "| GUID | Files |" >> "$GITHUB_STEP_SUMMARY"
+            echo "|------|-------|" >> "$GITHUB_STEP_SUMMARY"
+            while IFS=$'\t' read -r guid filestr; do
+              files=$(echo "$filestr" | tr '|' ',' | sed 's/,$//' | sed 's|\./||g')
+              echo "| \`$guid\` | $files |" >> "$GITHUB_STEP_SUMMARY"
+            done <<< "$DUPES"
+
             exit 1
           fi
 
           echo "All GUIDs in this PR are unique across the repository."
+          echo "# GUID check report" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "## Duplicate GUIDs" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "All GUIDs in this PR are unique across the repository." >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Comment on PR
+      - name: Check for changed or removed GUIDs
+        id: changed
+        if: always()
+        run: |
+          LC_ALL=C
+          export LC_ALL
+
+          # Get modified + renamed files — added files can't have a changed GUID.
+          # --name-status output per line:
+          #   M<TAB>path
+          #   R<score><TAB>old_path<TAB>new_path
+          MODIFIED_FILES=$(git diff --name-status --find-renames --diff-filter=MR origin/${{ github.base_ref }}...HEAD -- '*.md' '**/*.md' || true)
+
+          if [ -z "$MODIFIED_FILES" ]; then
+            echo "No modified or renamed markdown files in this PR."
+            echo "has_changed=false" >> "$GITHUB_OUTPUT"
+            echo "## Changed GUIDs" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "No modified or renamed markdown files in this PR." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          > /tmp/changed_guids.txt
+
+          while IFS=$'\t' read -r status field2 field3; do
+            case "$status" in
+              M)  old_path="$field2"; new_path="$field2" ;;
+              R*) old_path="$field2"; new_path="$field3" ;;
+              *)  continue ;;
+            esac
+
+            # Skip the /includes/ directory on either side
+            case "$old_path" in */includes/*) continue ;; esac
+            case "$new_path" in */includes/*) continue ;; esac
+
+            [ -f "$new_path" ] || continue
+
+            # Get current GUID from the working tree (new path)
+            CURRENT_GUID=$(sed '1s/^\xEF\xBB\xBF//' "$new_path" | tr -d '\r' | sed -n '2,/^---$/p' | grep -i '^awa-articleGuid:' | sed 's/^[^:]*:\s*//' | tr -d '[:space:]')
+
+            # Get base branch GUID from the OLD path (handles renames correctly)
+            BASE_GUID=$(git show "origin/${{ github.base_ref }}:${old_path}" 2>/dev/null | sed '1s/^\xEF\xBB\xBF//' | tr -d '\r' | sed -n '2,/^---$/p' | grep -i '^awa-articleGuid:' | sed 's/^[^:]*:\s*//' | tr -d '[:space:]')
+
+            # Nothing to protect if the base had no GUID
+            if [ -z "$BASE_GUID" ]; then
+              continue
+            fi
+
+            if [ -z "$CURRENT_GUID" ]; then
+              # GUID was removed — Assign workflow would replace it with a new one on merge.
+              printf '%s\t%s\t%s\n' "$new_path" "$BASE_GUID" "(removed)" >> /tmp/changed_guids.txt
+              echo "GUID removed from $new_path (was $BASE_GUID)"
+            elif [ "$(echo "$BASE_GUID" | tr '[:upper:]' '[:lower:]')" != "$(echo "$CURRENT_GUID" | tr '[:upper:]' '[:lower:]')" ]; then
+              printf '%s\t%s\t%s\n' "$new_path" "$BASE_GUID" "$CURRENT_GUID" >> /tmp/changed_guids.txt
+              echo "GUID changed in $new_path: $BASE_GUID -> $CURRENT_GUID"
+            fi
+          done <<< "$MODIFIED_FILES"
+
+          if [ -s /tmp/changed_guids.txt ]; then
+            echo "has_changed=true" >> "$GITHUB_OUTPUT"
+            echo "::error::One or more awa-articleGuid values were accidentally changed or removed in this PR!"
+
+            echo "## Changed GUIDs" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "**One or more GUIDs were accidentally changed or removed.** Restore the original GUID for each file:" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "| File | Original GUID | Changed to |" >> "$GITHUB_STEP_SUMMARY"
+            echo "|------|---------------|------------|" >> "$GITHUB_STEP_SUMMARY"
+            while IFS=$'\t' read -r file base_guid current_guid; do
+              echo "| \`$file\` | \`$base_guid\` | \`$current_guid\` |" >> "$GITHUB_STEP_SUMMARY"
+            done < /tmp/changed_guids.txt
+
+            exit 1
+          fi
+
+          echo "No GUIDs were accidentally changed or removed."
+          echo "has_changed=false" >> "$GITHUB_OUTPUT"
+          echo "## Changed GUIDs" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "No GUIDs were accidentally changed or removed." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Comment on PR for changed GUIDs
+        if: always() && steps.changed.outputs.has_changed == 'true'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.AccessToken }}
+          script: |
+            const fs = require('fs');
+            const lines = fs.readFileSync('/tmp/changed_guids.txt', 'utf8').trim().split('\n');
+
+            let body = '## One or more GUIDs were accidentally changed or removed\n\n';
+            body += 'The `awa-articleGuid` field must not be modified or removed for existing articles. Please restore the original GUID for each file listed below.\n\n';
+            body += '| File path | Restore to | Current (incorrect) |\n| --- | --- | --- |\n';
+
+            for (const line of lines) {
+              const [file, baseGuid, currentGuid] = line.split('\t');
+              body += `| \`${file}\` | \`${baseGuid}\` | \`${currentGuid}\` |\n`;
+            }
+
+            // Delete previous changed-GUID comments (matches both old and new title prefixes)
+            const comments = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number
+            });
+
+            for (const c of comments.data) {
+              if (c.body.startsWith('## One or more GUIDs were accidentally changed')) {
+                await github.rest.issues.deleteComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  comment_id: c.id
+                });
+              }
+            }
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: body
+            });
+
+      - name: Comment on PR for duplicate GUIDs
         if: always() && steps.check.outputs.has_dupes == 'true'
-        uses: actions/github-script@v8
+        uses: actions/github-script@v7
         with:
           github-token: ${{ secrets.AccessToken }}
           script: |
