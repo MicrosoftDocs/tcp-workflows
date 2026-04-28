@@ -16,7 +16,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 0
           token: ${{ secrets.AccessToken }}
@@ -223,7 +223,7 @@ jobs:
 
       - name: Comment on PR for changed GUIDs
         if: always() && steps.changed.outputs.has_changed == 'true'
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
         with:
           github-token: ${{ secrets.AccessToken }}
           script: |
@@ -265,7 +265,7 @@ jobs:
 
       - name: Comment on PR for duplicate GUIDs
         if: always() && steps.check.outputs.has_dupes == 'true'
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
         with:
           github-token: ${{ secrets.AccessToken }}
           script: |
