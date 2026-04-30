@@ -57,7 +57,7 @@ jobs:
             $Labels = $GitHubData.event.pull_request.labels
             $PrUrl = $GitHubData.event.pull_request.html_url
 
-            $WorkflowsResourcePath = "https://api.github.com/repos/MicrosoftDocs/microsoft-365-docs/contents/.github/workflows/resources"
+            $WorkflowsResourcePath = "https://api.github.com/repos/MicrosoftDocs/tcp-workflows/contents/.github/workflows/resources"
             $WorkflowsRef = "workflows-prod"
 
             $WarningLabelName = "Merge large pull request"

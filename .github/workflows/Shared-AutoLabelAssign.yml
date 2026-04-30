@@ -172,7 +172,7 @@ jobs:
             $ServiceToGitHubTeamMapUrl = $GitHubApiUrl + $ServiceToGitHubTeamMapRepo + $ServiceToGitHubTeamMapFilePath + "?ref=$ServiceToGitHubTeamMapRef"
 
             # Path to central workflow resources location.
-            $WorkflowsResourcePath = "https://api.github.com/repos/MicrosoftDocs/microsoft-365-docs/contents/.github/workflows/resources"
+            $WorkflowsResourcePath = "https://api.github.com/repos/MicrosoftDocs/tcp-workflows/contents/.github/workflows/resources"
             $WorkflowsRef = "workflows-prod"
 
             # Set repo variables

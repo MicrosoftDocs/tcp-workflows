@@ -63,7 +63,7 @@ jobs:
             # URL of the org team to check. We're using the "everyone" team in MicrosoftDocs. 
             $OrgTeamUrl = "https://api.github.com/orgs/microsoftdocs/teams/everyone/memberships/"
 
-            $WorkflowsResourcePath = "https://api.github.com/repos/MicrosoftDocs/microsoft-365-docs/contents/.github/workflows/resources"
+            $WorkflowsResourcePath = "https://api.github.com/repos/MicrosoftDocs/tcp-workflows/contents/.github/workflows/resources"
             $WorkflowsRef = "workflows-prod"
 
             #####################
