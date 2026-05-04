@@ -1561,7 +1561,7 @@ jobs:
 
                                         Try {
 
-                                            $PrSubmitterHasSignOffMessage = $PrCreator + $(Get-PrMessage "AutoLabelAssign-PrSubmitterHasSignOff")
+                                            $PrSubmitterHasSignOffMessage = "@$PrCreator" + $(Get-PrMessage "AutoLabelAssign-PrSubmitterHasSignOff")
                                             Set-PrConversationMessage -Message $PrSubmitterHasSignOffMessage
 
                                             $LoggingData.ReviewStatus = "NotReadOnly"
