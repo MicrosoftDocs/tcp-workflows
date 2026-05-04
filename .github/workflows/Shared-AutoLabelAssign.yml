@@ -1557,10 +1557,22 @@ jobs:
 
                                     } Else {
                                     
-                                        Write-Host "Not adding reviewer because submitter can sign off PR. User permission: $UserPermission."
+                                        Write-Host "Not adding reviewer because submitter can sign off PR. Posting message to PR conversation. User permission: $UserPermission."
 
-                                        $LoggingData.ReviewStatus = "NotReadOnly"
-                                        $LoggingData.ReviewDetails = "Not adding reviewer because submitter can sign off PR. User permission: $UserPermission."                             
+                                        Try {
+
+                                            $PrSubmitterHasSignOffMessage = "@$PrCreator" + $(Get-PrMessage "AutoLabelAssign-PrSubmitterHasSignOff")
+                                            Set-PrConversationMessage -Message $PrSubmitterHasSignOffMessage
+
+                                            $LoggingData.ReviewStatus = "NotReadOnly"
+                                            $LoggingData.ReviewDetails = "Not adding reviewer because submitter can sign off PR. Posted message to PR conversation. User permission: $UserPermission."                             
+
+                                        } Catch {
+                                         
+                                            $LoggingData.ReviewStatus = "NotReadOnly"
+                                            $LoggingData.ReviewDetails = $_
+                                        
+                                        }
                                     
                                     }
 

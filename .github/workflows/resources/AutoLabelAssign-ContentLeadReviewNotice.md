@@ -3,10 +3,10 @@ You've been added as a reviewer to this pull request because you're [listed](htt
 
 Before this PR can be merged, a Content Lead needs to add the **Sign off** label to it. Only **one** of the listed reviewers needs to add the **Sign off** label. Before you sign off a PR, confirm the following:
 
+- The PR is not in draft state. When the changes in this PR are ready to be published, select the **Ready to merge** button at the bottom of the page.
 - Article content has been checked for technical accuracy.
 - There are no errors or warnings in build validation.
 - There are no severity 1 or 2 PoliCheck issues.
-- All articles have a minimum Acrolinx score of 80.
 - All **required** PR checks at the bottom of the PR are passing.
 
 After you've confirmed the above, do the following to sign off:
