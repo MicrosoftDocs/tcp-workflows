@@ -25,7 +25,9 @@ permissions:
 
 jobs:
   assign-guids:
-    if: github.repository_owner == 'MicrosoftDocs'
+    # Temporarily disabled (no-op). Restore by changing this back to:
+    #   if: github.repository_owner == 'MicrosoftDocs'
+    if: false
     runs-on: ubuntu-latest
     steps:
       - name: Checkout main
