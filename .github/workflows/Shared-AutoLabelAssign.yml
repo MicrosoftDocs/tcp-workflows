@@ -101,6 +101,11 @@ jobs:
             $IsPrDraft = $GitHubData.event.pull_request.draft
             $GitHubSender = $GitHubData.event.sender.login
             $GitHubRepoName = $GitHubData.event.repository.name
+            
+            $IsEndUser = $GitHubRepoName -like 'enduser-*'
+            $Platform = If ($IsEndUser) { "EndUser" } Else { "LMC" }
+            Write-Host "Repo $GitHubRepoName resolved to platform: $Platform"
+
             $RepoLabelUrl = $GitHubData.event.repository.labels_url
             $PrFileListUrl = "$($GitHubData.event.pull_request.url)/files"
             $IssueUrl = $GitHubData.event.pull_request.issue_url
@@ -157,6 +162,8 @@ jobs:
                 ReviewStatus            = $Null
                 ReviewDetails           = $Null
                 ServiceSubService       = $Null
+                Platform                = $Platform
+                UsedLmcFallback         = $False
                 PrEvent                 = $GitRequestEvent
                 PrAction                = $GitHubAction
                 PrState                 = $GitHubState
@@ -925,7 +932,10 @@ jobs:
                 [CmdletBinding()]
                 Param(
                     [Parameter(Mandatory = $true)]
-                    [String]$CsvContent
+                    [String]$CsvContent,
+
+                    # When $true, expand using the EndUser (SMC) columns instead of the LMC columns.
+                    [bool]$UseEndUser = $false
                 )
                 
                 # Parse the CSV content
@@ -935,18 +945,31 @@ jobs:
                 $ExpandedRows = @()
                 
                 ForEach ($Row in $CsvData) {
-                    # Get the services and subservices, handling null/empty values
-                    $Services = If ([String]::IsNullOrWhiteSpace($Row.Service)) { @('') } 
-                            Else { $Row.Service -split ';' | ForEach-Object { $_.Trim() } }
-                    
-                    $SubServices = If ([String]::IsNullOrWhiteSpace($Row.SubService)) { @('') } 
-                                Else { $Row.SubService -split ';' | ForEach-Object { $_.Trim() } }
-                    
+
+                    # Select the service/subservice column pair for the active platform.
+                    $SvcRaw = If ($UseEndUser) { $Row.EndUserService }    Else { $Row.Service }
+                    $SubRaw = If ($UseEndUser) { $Row.EndUserSubService } Else { $Row.SubService }
+
+                    # Service list: split on ';', trim, drop empty tokens (an empty service can never match).
+                    $Services = If ([String]::IsNullOrWhiteSpace($SvcRaw)) { @() } 
+                                Else { $SvcRaw -split ';' | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' } }
+
+                    # No usable service for this platform: row does not apply here.
+                    If (-not $Services) { Continue }
+
+                    # Subservice list: split on ';' and trim, but KEEP empty tokens. A leading ';' is the
+                    # deliberate "match any/blank subservice" idiom, so do not filter empties here.
+                    $SubServices = If ([String]::IsNullOrWhiteSpace($SubRaw)) { @('') } 
+                                Else { $SubRaw -split ';' | ForEach-Object { $_.Trim() } }
+
+                    # Normalize the product name (the CSV has a leading space on each data row).
+                    $Product = If ($null -ne $Row.Product) { $Row.Product.Trim() } Else { $Row.Product }
+
                     # Create a new row for each combination of service and subservice
                     ForEach ($Service in $Services) {
                         ForEach ($SubService in $SubServices) {
                             $NewRow = [PSCustomObject]@{
-                                Product = $Row.Product
+                                Product = $Product
                                 Service = $Service
                                 SubService = $SubService
                                 GitHubTeam = $Row.GitHubTeam
@@ -978,6 +1001,10 @@ jobs:
                 
                     
                 $GitHubTeam = @()
+
+                # Normalize inputs: trim whitespace. Matching stays case-insensitive ('-eq').
+                $Service    = If ($null -ne $Service)    { $Service.Trim() }    Else { $Service }
+                $SubService = If ($null -ne $SubService) { $SubService.Trim() } Else { $SubService }
 
                 Write-Host "Article service: $Service"
                 Write-Host "Article subservice: $SubService"
@@ -1464,7 +1491,13 @@ jobs:
 
                                         # Get the service/subservice to GitHub account map
                                         $ServiceToTeamMap = Get-ServiceGitHubTeamMappingTable
-                                        $ExpandedServiceSubServiceRows = Expand-ServiceSubServiceRows -CsvContent $ServiceToTeamMap
+
+                                        # Primary rows = active platform. EndUser repos also build LMC rows as a
+                                        # one-directional fallback (used per-file only when no EndUser mapping matched).
+                                        $ExpandedServiceSubServiceRows = @(Expand-ServiceSubServiceRows -CsvContent $ServiceToTeamMap -UseEndUser:$IsEndUser)
+                                        $FallbackServiceSubServiceRows = If ($IsEndUser) {
+                                                                             @(Expand-ServiceSubServiceRows -CsvContent $ServiceToTeamMap -UseEndUser:$false)
+                                                                         } Else { @() }
 
                                         $ReviewerTeamArray = @()
                                         $ServiceSubServiceArray = @() # Used in logging
@@ -1475,7 +1508,20 @@ jobs:
 
                                                 $ReviewerTeams = $Null
 
-                                                $ReviewerTeams = Get-GitHubReviewerTeams -DataArray $ExpandedServiceSubServiceRows -Service $File.Service -SubService $File.SubService
+                                                # Guard: -DataArray is Mandatory and throws on an empty collection.
+                                                If ($ExpandedServiceSubServiceRows.Count -gt 0) {
+                                                    $ReviewerTeams = Get-GitHubReviewerTeams -DataArray $ExpandedServiceSubServiceRows -Service $File.Service -SubService $File.SubService
+                                                }
+
+                                                # One-directional EndUser -> LMC fallback when no EndUser mapping matched.
+                                                If ((-not $ReviewerTeams) -and ($FallbackServiceSubServiceRows.Count -gt 0)) {
+
+                                                    Write-Host "No EndUser mapping for $($File.Service)/$($File.SubService). Falling back to LMC mapping."
+                                                    $ReviewerTeams = Get-GitHubReviewerTeams -DataArray $FallbackServiceSubServiceRows -Service $File.Service -SubService $File.SubService
+
+                                                    If ($ReviewerTeams) { $LoggingData.UsedLmcFallback = $True }
+
+                                                }
 
                                                 $ServiceSubServiceArray += "$($File.Service)\$($File.Subservice)"
 
