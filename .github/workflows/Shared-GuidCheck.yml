@@ -8,7 +8,7 @@ name: GUID check
 # calling repo's branch protection / ruleset so a failure blocks the merge.
 #
 # This workflow runs on `pull_request_target` (via the caller) so fork PRs are never
-# gated behind a manual "Approve and run" click. To stay safe it NEVER checks out fork
+# gated behind a manual "Approve and run" click. For security, it never checks out fork
 # code: the base branch is checked out (trusted) for the repo-wide GUID inventory, and
 # the PR's changed .md files are downloaded as DATA via the GitHub API (never executed).
 
@@ -24,7 +24,7 @@ on:
 
 jobs:
   check-guids:
-    if: github.repository_owner == 'MicrosoftDocs' || github.repository_owner == 'andymyersMSFT'
+    if: github.repository_owner == 'MicrosoftDocs'
     runs-on: ubuntu-latest
     env:
       # Passed via env (not inlined into run scripts) to avoid expression injection.
@@ -259,7 +259,7 @@ jobs:
           PATTERN_FILE="${{ steps.extract.outputs.pattern_file }}"
 
           # Base-side paths touched by this PR (modified path, renamed-from previous,
-          # removed path). These must be EXCLUDED from the base inventory so a file that
+          # removed path). These are excluded from the base inventory so a file that
           # simply keeps its own GUID isn't flagged as a duplicate against its own base
           # copy. The merged repo state = (base minus these paths) plus the PR files.
           jq -r '.[] | (.previous // .path)' "$PR_FILES_DIR/_manifest.json" 2>/dev/null > /tmp/pr_base_paths.txt || true
