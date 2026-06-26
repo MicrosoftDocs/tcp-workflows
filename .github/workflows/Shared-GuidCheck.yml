@@ -588,12 +588,20 @@ jobs:
               const keep = all.filter(function (f) { return hadGuidOnBase(f, guid); });
               let change = all.filter(function (f) { return !hadGuidOnBase(f, guid); });
               if (keep.length === 0 && change.length > 1) change = change.slice(1);
+              // Files that keep this GUID (the existing owner of the identity). Reported in
+              // the comment so the author sees exactly which article their GUID collides with.
+              const retained = all.filter(function (f) { return change.indexOf(f) === -1; });
               for (const f of change) {
                 const gl = guidLine(f);
                 if (gl) {
                   const newGuid = crypto.randomUUID();
+                  const others = retained.filter(function (x) { return x !== f; });
+                  const usedBy = others.length
+                    ? 'already used by ' + others.map(function (x) { return '`' + x + '`'; }).join(', ')
+                    : 'used by more than one file in this PR';
                   const body = mkBody(
-                    '**Duplicate `awa-articleGuid`** \u2014 `' + guid + '` is already used by another article.',
+                    '**Duplicate `awa-articleGuid`** \u2014 `' + guid + '` is ' + usedBy
+                      + '. Each article needs its own unique GUID.',
                     'awa-articleGuid: ' + newGuid);
                   items.push({ file: f, line: gl, body: body });
                 }
