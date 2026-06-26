@@ -462,6 +462,15 @@ jobs:
             const owner = context.repo.owner;
             const repo = context.repo.repo;
             const prNumber = pr.number;
+            const headRef = pr.head.ref;
+
+            // The "Commit suggestion" (Apply) button only works for people with push access
+            // to the PR's head branch. For a fork PR that requires the author to have enabled
+            // "Allow edits from maintainers" (maintainer_can_modify). Same-repo PRs are always
+            // modifiable by repo writers.
+            const isFork = !!(pr.head.repo && pr.head.repo.full_name
+              && pr.head.repo.full_name !== (owner + '/' + repo));
+            const canModify = !isFork || pr.maintainer_can_modify === true;
 
             function readTsv(p) {
               try {
@@ -494,6 +503,25 @@ jobs:
               } catch (e) { return false; }
             }
 
+            // Build a comment body. When the head branch is modifiable, emit a
+            // ```suggestion``` block so reviewers get a one-click "Commit suggestion".
+            // Otherwise emit plain instructions telling the maintainer to fork the branch
+            // and merge back, because the Apply button would not work for them.
+            function mkBody(intro, fixLines) {
+              if (canModify) {
+                return intro + ' Click **Commit suggestion** to apply.\n\n'
+                  + F + 'suggestion\n' + fixLines + '\n' + F + '\n' + MARKER;
+              }
+              return intro + '\n\n'
+                + '> [!IMPORTANT]\n'
+                + '> No one-click fix is available because maintainers can\'t edit this pull '
+                + 'request\'s branch (**Allow edits from maintainers** is off). Please create a '
+                + 'fork of `' + headRef + '`, apply the change below, and merge it back into `'
+                + headRef + '`.\n\n'
+                + 'Apply this change:\n\n'
+                + F + '\n' + fixLines + '\n' + F + '\n' + MARKER;
+            }
+
             // Remove our previous suggestion comments (and legacy plain comments) so re-runs
             // don't pile up and resolved issues get cleaned away.
             const oldReview = await github.paginate(github.rest.pulls.listReviewComments, {
@@ -524,9 +552,9 @@ jobs:
               const parts = ln.split('\t');
               const file = parts[0]; const guid = parts[1];
               if (!file) continue;
-              const body = '**Missing `awa-articleGuid`.** This new article needs a unique GUID. '
-                + 'Click **Commit suggestion** to add the one below (or edit it to your own), then it is saved to this PR.\n\n'
-                + F + 'suggestion\n' + firstLine(file) + '\nawa-articleGuid: ' + guid + '\n' + F + '\n' + MARKER;
+              const body = mkBody(
+                '**Missing `awa-articleGuid`.** This new article needs a unique GUID.',
+                firstLine(file) + '\nawa-articleGuid: ' + guid);
               items.push({ file: file, line: 1, body: body });
             }
 
@@ -536,16 +564,16 @@ jobs:
               const file = parts[0]; const baseGuid = parts[1]; const current = parts[2];
               if (!file) continue;
               if (current === '(removed)') {
-                const body = '**`awa-articleGuid` was removed.** Existing articles must keep their GUID. '
-                  + 'Click **Commit suggestion** to restore it.\n\n'
-                  + F + 'suggestion\n' + firstLine(file) + '\nawa-articleGuid: ' + baseGuid + '\n' + F + '\n' + MARKER;
+                const body = mkBody(
+                  '**`awa-articleGuid` was removed.** Existing articles must keep their GUID.',
+                  firstLine(file) + '\nawa-articleGuid: ' + baseGuid);
                 items.push({ file: file, line: 1, body: body });
               } else {
                 const gl = guidLine(file);
                 if (gl) {
-                  const body = '**`awa-articleGuid` was changed.** Existing articles must keep their original GUID. '
-                    + 'Click **Commit suggestion** to restore it.\n\n'
-                    + F + 'suggestion\nawa-articleGuid: ' + baseGuid + '\n' + F + '\n' + MARKER;
+                  const body = mkBody(
+                    '**`awa-articleGuid` was changed.** Existing articles must keep their original GUID.',
+                    'awa-articleGuid: ' + baseGuid);
                   items.push({ file: file, line: gl, body: body });
                 }
               }
@@ -564,9 +592,9 @@ jobs:
                 const gl = guidLine(f);
                 if (gl) {
                   const newGuid = crypto.randomUUID();
-                  const body = '**Duplicate `awa-articleGuid`** \u2014 `' + guid + '` is already used by another article. '
-                    + 'Click **Commit suggestion** to replace it with a new unique GUID.\n\n'
-                    + F + 'suggestion\nawa-articleGuid: ' + newGuid + '\n' + F + '\n' + MARKER;
+                  const body = mkBody(
+                    '**Duplicate `awa-articleGuid`** \u2014 `' + guid + '` is already used by another article.',
+                    'awa-articleGuid: ' + newGuid);
                   items.push({ file: f, line: gl, body: body });
                 }
               }
