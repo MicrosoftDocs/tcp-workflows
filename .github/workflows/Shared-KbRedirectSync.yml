@@ -301,9 +301,25 @@ jobs:
           }
           "@
 
+          # Pick a merge method the siteroot repo actually allows. enablePullRequestAutoMerge
+          # fails if the requested method isn't enabled in the repo's settings (e.g. a repo that
+          # permits squash only). Prefer MERGE (prior behavior), then SQUASH, then REBASE. If the
+          # settings can't be read, fall back to SQUASH — the common target permits squash only.
+          $MergeMethod = $null
+          try {
+              $RepoInfo = Invoke-RestMethod -Uri "https://api.github.com/repos/$SiterootRepo" -Method GET -Headers $Headers -ErrorAction Stop
+              if     ($RepoInfo.allow_merge_commit) { $MergeMethod = 'MERGE' }
+              elseif ($RepoInfo.allow_squash_merge) { $MergeMethod = 'SQUASH' }
+              elseif ($RepoInfo.allow_rebase_merge) { $MergeMethod = 'REBASE' }
+          } catch {
+              Write-Host "::warning::Could not read merge settings for ${SiterootRepo}: $_"
+          }
+          if (-not $MergeMethod) { $MergeMethod = 'SQUASH' }
+          Write-Host "Auto-merge method for ${SiterootRepo}: $MergeMethod"
+
           $Enabled = $false
           for ($i = 0; $i -lt 6 -and -not $Enabled; $i++) {
-              $MutationBody = @{ query = $Mutation; variables = @{ id = $NodeId; method = 'MERGE' } } | ConvertTo-Json -Depth 5
+              $MutationBody = @{ query = $Mutation; variables = @{ id = $NodeId; method = $MergeMethod } } | ConvertTo-Json -Depth 5
               try {
                   $Resp = Invoke-RestMethod -Uri 'https://api.github.com/graphql' -Method POST -Headers $Headers -Body $MutationBody
                   $EnabledAt = $Resp.data.enablePullRequestAutoMerge.pullRequest.autoMergeRequest.enabledAt
