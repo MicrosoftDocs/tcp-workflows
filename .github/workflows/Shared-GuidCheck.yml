@@ -29,6 +29,11 @@ jobs:
     env:
       # Passed via env (not inlined into run scripts) to avoid expression injection.
       BASE_REF: ${{ github.base_ref }}
+      # True when the PR's head repo differs from the base repo (a fork PR). Fork
+      # contributors own their branch, so they can apply a suggestion AND can legitimately
+      # change a GUID to deduplicate. Same-repo PRs may not modify existing GUIDs (they must
+      # fork to deduplicate). Exposed as env so the bash checks can branch on it.
+      IS_FORK: ${{ github.event.pull_request.head.repo.full_name != github.repository }}
     steps:
       # PR_FILES_DIR holds untrusted PR file content as data only (never executed).
       # Set here (not at job-level env) because the runner context isn't available there.
@@ -36,12 +41,17 @@ jobs:
         run: echo "PR_FILES_DIR=$RUNNER_TEMP/pr-files" >> "$GITHUB_ENV"
 
       # Trusted base checkout for the repo-wide duplicate inventory and base-side GUID
-      # reads. No `ref:` -> under pull_request_target this is the base branch we control.
-      # persist-credentials: false keeps the privileged token out of .git/config; all
-      # analysis below is local git reads that need no credentials.
+      # reads. ref is pinned to the PR's BASE branch (github.base_ref) so the working-tree
+      # GUID inventory reflects the branch this PR actually targets — not the repo default
+      # branch. (Without an explicit ref, checkout lands on the default branch, which makes
+      # the inventory and the `origin/$BASE_REF` reads disagree for PRs targeting a
+      # non-default branch.) base_ref is the upstream target branch, never fork-controlled,
+      # so checking it out is safe. persist-credentials: false keeps the privileged token
+      # out of .git/config; all analysis below is local git reads that need no credentials.
       - name: Checkout base (trusted)
         uses: actions/checkout@v5
         with:
+          ref: ${{ github.base_ref }}
           fetch-depth: 0
           persist-credentials: false
 
@@ -272,43 +282,52 @@ jobs:
           PATTERN_FILE="${{ steps.extract.outputs.pattern_file }}"
 
           # Base-side paths touched by this PR (modified path, renamed-from previous,
-          # removed path). These are excluded from the base inventory so a file that
+          # removed path). These are excluded from the DUPLICATE inventory so a file that
           # simply keeps its own GUID isn't flagged as a duplicate against its own base
           # copy. The merged repo state = (base minus these paths) plus the PR files.
+          # (The base-was-duplicate counts built below are intentionally UNFILTERED.)
           jq -r '.[] | (.previous // .path)' "$PR_FILES_DIR/_manifest.json" 2>/dev/null > /tmp/pr_base_paths.txt || true
 
-          # Base-branch inventory: which base .md files contain one of the PR GUIDs.
-          # The PR GUID values are read from PATTERN_FILE as DATA (getline) and the file
-          # paths are passed as awk variables — PR-derived values never become program text.
+          # Full repo-wide GUID map: EVERY awa-articleGuid in the base tree -> guid<TAB>file.
+          # This single filesystem scan is the complete inventory of the repo's GUIDs; two
+          # consumers derive from it: (a) duplicate detection in this step, and (b) the
+          # base-was-duplicate counts used by the changed-GUID step. GUID values are emitted
+          # lowercased so both consumers can compare case-insensitively.
           find . -name '*.md' -not -path '*/includes/*' -print0 | \
-            xargs -0 awk -v PF="$PATTERN_FILE" -v EX="/tmp/pr_base_paths.txt" '
-              BEGIN {
-                while ((getline g < PF) > 0) {
-                  gsub(/[[:space:]]/, "", g)
-                  if (length(g) > 0) want[tolower(g)] = 1
-                }
-                while ((getline p < EX) > 0) {
-                  if (length(p) > 0) exclude[p] = 1
-                }
-              }
-              FNR == 1 {
-                fn = FILENAME
-                sub(/^\.\//, "", fn)
-                skip = (fn in exclude)
-              }
-              skip { nextfile }
+            xargs -0 awk '
+              FNR == 1 { fn = FILENAME; sub(/^\.\//, "", fn) }
               FNR > 50 { nextfile }
               tolower($0) ~ /awa-articleguid:/ {
                 val = $0
                 sub(/^[^:]*:[[:space:]]*/, "", val)
                 gsub(/[[:space:]]/, "", val)
                 val = tolower(val)
-                if (val in want) {
-                  print val "\t" fn
-                }
+                if (length(val) > 0) print val "\t" fn
                 nextfile
               }
-            ' > /tmp/base_guid_files.tsv || true
+            ' > /tmp/base_all_guid_files.tsv || true
+
+          # (b) Unfiltered counts: guid<TAB>count over the WHOLE base tree. The changed-GUID
+          # step reads this to decide whether a modified file's PRIOR GUID was itself a
+          # duplicate on base (>= 2 occurrences) and is therefore eligible for dedup.
+          awk -F'\t' '{ c[$1]++ } END { for (g in c) print g "\t" c[g] }' \
+            /tmp/base_all_guid_files.tsv > /tmp/base_guid_counts.tsv || true
+
+          # (a) Duplicate inventory: restrict the full map to base files whose GUID matches a
+          # PR GUID (the "want" set, read as DATA via getline) and that are NOT touched by
+          # this PR. PR-derived values are awk variables / data, never program text.
+          awk -F'\t' -v PF="$PATTERN_FILE" -v EX="/tmp/pr_base_paths.txt" '
+            BEGIN {
+              while ((getline g < PF) > 0) {
+                gsub(/[[:space:]]/, "", g)
+                if (length(g) > 0) want[tolower(g)] = 1
+              }
+              while ((getline p < EX) > 0) {
+                if (length(p) > 0) exclude[p] = 1
+              }
+            }
+            { if (($1 in want) && !($2 in exclude)) print $1 "\t" $2 }
+          ' /tmp/base_all_guid_files.tsv > /tmp/base_guid_files.tsv || true
 
           rm -f "$PATTERN_FILE"
 
@@ -386,6 +405,16 @@ jobs:
             exit 0
           fi
 
+          # How many base articles carried a given GUID (from the full repo-wide map).
+          # >= 2 means the GUID was a duplicate on the base branch, so changing it is a
+          # legitimate deduplication. The map keys are already lowercased.
+          base_count_of() {
+            awk -F'\t' -v g="$1" '$1 == g { print $2; f = 1; exit } END { if (!f) print 0 }' /tmp/base_guid_counts.tsv
+          }
+
+          # Output rows: new_path<TAB>base_guid<TAB>current_or_(removed)<TAB>reason
+          # reason is one of: removed | must-fork | illegit-change. Allowed dedups (fork PR
+          # changing a GUID that WAS a base duplicate) are not written — they pass silently.
           > /tmp/changed_guids.txt
 
           while IFS=$'\t' read -r new_path old_path; do
@@ -407,38 +436,59 @@ jobs:
               continue
             fi
 
+            BASE_LC=$(echo "$BASE_GUID" | tr '[:upper:]' '[:lower:]')
+
             if [ -z "$CURRENT_GUID" ]; then
-              # GUID was removed — Assign workflow would replace it with a new one on merge.
-              printf '%s\t%s\t%s\n' "$new_path" "$BASE_GUID" "(removed)" >> /tmp/changed_guids.txt
-              echo "GUID removed from $new_path (was $BASE_GUID)"
-            elif [ "$(echo "$BASE_GUID" | tr '[:upper:]' '[:lower:]')" != "$(echo "$CURRENT_GUID" | tr '[:upper:]' '[:lower:]')" ]; then
-              printf '%s\t%s\t%s\n' "$new_path" "$BASE_GUID" "$CURRENT_GUID" >> /tmp/changed_guids.txt
-              echo "GUID changed in $new_path: $BASE_GUID -> $CURRENT_GUID"
+              # Removal is never a valid deduplication — always an error.
+              printf '%s\t%s\t%s\t%s\n' "$new_path" "$BASE_GUID" "(removed)" "removed" >> /tmp/changed_guids.txt
+              echo "GUID removed from $new_path (was $BASE_GUID) — error"
+            elif [ "$BASE_LC" != "$(echo "$CURRENT_GUID" | tr '[:upper:]' '[:lower:]')" ]; then
+              if [ "$IS_FORK" != "true" ]; then
+                # Same-repo PR: GUIDs may not be modified here. To deduplicate, fork first.
+                printf '%s\t%s\t%s\t%s\n' "$new_path" "$BASE_GUID" "$CURRENT_GUID" "must-fork" >> /tmp/changed_guids.txt
+                echo "GUID changed in $new_path ($BASE_GUID -> $CURRENT_GUID) on a same-repo PR — error (must fork to deduplicate)"
+              else
+                BASE_COUNT=$(base_count_of "$BASE_LC")
+                if [ "${BASE_COUNT:-0}" -ge 2 ]; then
+                  # Fork PR changing a GUID that was a duplicate on base = legitimate dedup.
+                  echo "GUID changed in $new_path ($BASE_GUID -> $CURRENT_GUID) deduplicates a base duplicate (count=$BASE_COUNT) — allowed"
+                else
+                  # Fork PR changing a GUID that was unique on base — must be restored.
+                  printf '%s\t%s\t%s\t%s\n' "$new_path" "$BASE_GUID" "$CURRENT_GUID" "illegit-change" >> /tmp/changed_guids.txt
+                  echo "GUID changed in $new_path ($BASE_GUID -> $CURRENT_GUID) but base GUID was not a duplicate — error"
+                fi
+              fi
             fi
           done < /tmp/modified.tsv
 
           if [ -s /tmp/changed_guids.txt ]; then
             echo "has_changed=true" >> "$GITHUB_OUTPUT"
-            echo "::error::One or more awa-articleGuid values were accidentally changed or removed in this PR!"
+            echo "::error::One or more awa-articleGuid values were changed or removed in a way that isn't allowed!"
 
             echo "## Changed GUIDs" >> "$GITHUB_STEP_SUMMARY"
             echo "" >> "$GITHUB_STEP_SUMMARY"
-            echo "**One or more GUIDs were accidentally changed or removed.** Restore the original GUID for each file:" >> "$GITHUB_STEP_SUMMARY"
+            echo "**One or more GUIDs were changed or removed in a way that isn't allowed.** See the action needed for each file:" >> "$GITHUB_STEP_SUMMARY"
             echo "" >> "$GITHUB_STEP_SUMMARY"
-            echo "| File | Original GUID | Changed to |" >> "$GITHUB_STEP_SUMMARY"
-            echo "|------|---------------|------------|" >> "$GITHUB_STEP_SUMMARY"
-            while IFS=$'\t' read -r file base_guid current_guid; do
-              echo "| \`$file\` | \`$base_guid\` | \`$current_guid\` |" >> "$GITHUB_STEP_SUMMARY"
+            echo "| File | Original GUID | Changed to | Action needed |" >> "$GITHUB_STEP_SUMMARY"
+            echo "|------|---------------|------------|---------------|" >> "$GITHUB_STEP_SUMMARY"
+            while IFS=$'\t' read -r file base_guid current_guid reason; do
+              case "$reason" in
+                removed) action="Restore the GUID — existing articles must keep it" ;;
+                must-fork) action="GUIDs can't be changed in a same-repo PR; fork to deduplicate, or restore the original" ;;
+                illegit-change) action="Original GUID wasn't a duplicate; restore it" ;;
+                *) action="Restore the original GUID" ;;
+              esac
+              echo "| \`$file\` | \`$base_guid\` | \`$current_guid\` | $action |" >> "$GITHUB_STEP_SUMMARY"
             done < /tmp/changed_guids.txt
 
             exit 1
           fi
 
-          echo "No GUIDs were accidentally changed or removed."
+          echo "No disallowed GUID changes or removals."
           echo "has_changed=false" >> "$GITHUB_OUTPUT"
           echo "## Changed GUIDs" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "No GUIDs were accidentally changed or removed." >> "$GITHUB_STEP_SUMMARY"
+          echo "No disallowed GUID changes or removals." >> "$GITHUB_STEP_SUMMARY"
 
 
       - name: Post inline GUID suggestions
@@ -462,6 +512,14 @@ jobs:
             const owner = context.repo.owner;
             const repo = context.repo.repo;
             const prNumber = pr.number;
+
+            // The "Commit suggestion" (Apply) button only renders for viewers who can push
+            // to the PR's head branch. On a fork PR the contributor (author) owns the fork
+            // branch and can Apply, so the suggestion block is genuinely useful. On a
+            // same-repo PR we skip the block and show the value as plain text, to avoid
+            // showing an "apply me" affordance to people who can't act on it.
+            const isFork = !!(pr.head.repo && pr.head.repo.full_name
+              && pr.head.repo.full_name !== (owner + '/' + repo));
 
             function readTsv(p) {
               try {
@@ -494,6 +552,24 @@ jobs:
               } catch (e) { return false; }
             }
 
+            // Build a comment body. On a fork PR, emit a ```suggestion``` block so the
+            // contributor gets a one-click "Commit suggestion". On a same-repo PR, show the
+            // value as a plain code block (no apply affordance).
+            function mkBody(intro, fixLines) {
+              if (isFork) {
+                return intro + ' Click **Commit suggestion** to apply.\n\n'
+                  + F + 'suggestion\n' + fixLines + '\n' + F + '\n' + MARKER;
+              }
+              return intro + ' Update the `awa-articleGuid` as shown:\n\n'
+                + F + '\n' + fixLines + '\n' + F + '\n' + MARKER;
+            }
+
+            // Plain note (no suggestion block) — used when there is no one-click fix to offer,
+            // e.g. a same-repo PR that changed a GUID and must instead fork to deduplicate.
+            function mkNote(text) {
+              return text + '\n\n' + MARKER;
+            }
+
             // Remove our previous suggestion comments (and legacy plain comments) so re-runs
             // don't pile up and resolved issues get cleaned away.
             const oldReview = await github.paginate(github.rest.pulls.listReviewComments, {
@@ -524,28 +600,44 @@ jobs:
               const parts = ln.split('\t');
               const file = parts[0]; const guid = parts[1];
               if (!file) continue;
-              const body = '**Missing `awa-articleGuid`.** This new article needs a unique GUID. '
-                + 'Click **Commit suggestion** to add the one below (or edit it to your own), then it is saved to this PR.\n\n'
-                + F + 'suggestion\n' + firstLine(file) + '\nawa-articleGuid: ' + guid + '\n' + F + '\n' + MARKER;
+              const body = mkBody(
+                '**Missing `awa-articleGuid`.** This new article needs a unique GUID.',
+                firstLine(file) + '\nawa-articleGuid: ' + guid);
               items.push({ file: file, line: 1, body: body });
             }
 
-            // Changed / removed GUID (existing articles): restore the original GUID.
+            // Changed / removed GUID (existing articles). The reason column decides the fix:
+            //   removed         -> restore the original GUID (suggestion).
+            //   must-fork       -> same-repo PR changed a GUID; can't dedupe here. Plain note
+            //                      telling the author to fork to deduplicate, or restore.
+            //   illegit-change  -> fork PR changed a GUID that wasn't a duplicate -> restore.
             for (const ln of readTsv('/tmp/changed_guids.txt')) {
               const parts = ln.split('\t');
               const file = parts[0]; const baseGuid = parts[1]; const current = parts[2];
+              const reason = parts[3] || '';
               if (!file) continue;
-              if (current === '(removed)') {
-                const body = '**`awa-articleGuid` was removed.** Existing articles must keep their GUID. '
-                  + 'Click **Commit suggestion** to restore it.\n\n'
-                  + F + 'suggestion\n' + firstLine(file) + '\nawa-articleGuid: ' + baseGuid + '\n' + F + '\n' + MARKER;
+              if (reason === 'removed') {
+                const body = mkBody(
+                  '**`awa-articleGuid` was removed.** Existing articles must keep their GUID.',
+                  firstLine(file) + '\nawa-articleGuid: ' + baseGuid);
                 items.push({ file: file, line: 1, body: body });
+              } else if (reason === 'must-fork') {
+                const gl = guidLine(file);
+                const body = mkNote(
+                  '**`awa-articleGuid` was changed** (`' + baseGuid + '` \u2192 `' + current + '`). '
+                    + 'GUIDs on existing articles can\u2019t be modified in a same-repo PR. '
+                    + 'If you are deduplicating, create a **fork** of this repository, make the change '
+                    + 'in the fork, and open the PR from there. Otherwise, restore the original GUID `'
+                    + baseGuid + '`.');
+                items.push({ file: file, line: gl || 1, body: body });
               } else {
+                // illegit-change (fork PR, original GUID was not a duplicate) -> restore it.
                 const gl = guidLine(file);
                 if (gl) {
-                  const body = '**`awa-articleGuid` was changed.** Existing articles must keep their original GUID. '
-                    + 'Click **Commit suggestion** to restore it.\n\n'
-                    + F + 'suggestion\nawa-articleGuid: ' + baseGuid + '\n' + F + '\n' + MARKER;
+                  const body = mkBody(
+                    '**`awa-articleGuid` was changed,** but the original GUID `' + baseGuid
+                      + '` was not a duplicate, so it must be restored.',
+                    'awa-articleGuid: ' + baseGuid);
                   items.push({ file: file, line: gl, body: body });
                 }
               }
@@ -560,13 +652,21 @@ jobs:
               const keep = all.filter(function (f) { return hadGuidOnBase(f, guid); });
               let change = all.filter(function (f) { return !hadGuidOnBase(f, guid); });
               if (keep.length === 0 && change.length > 1) change = change.slice(1);
+              // Files that keep this GUID (the existing owner of the identity). Reported in
+              // the comment so the author sees exactly which article their GUID collides with.
+              const retained = all.filter(function (f) { return change.indexOf(f) === -1; });
               for (const f of change) {
                 const gl = guidLine(f);
                 if (gl) {
                   const newGuid = crypto.randomUUID();
-                  const body = '**Duplicate `awa-articleGuid`** \u2014 `' + guid + '` is already used by another article. '
-                    + 'Click **Commit suggestion** to replace it with a new unique GUID.\n\n'
-                    + F + 'suggestion\nawa-articleGuid: ' + newGuid + '\n' + F + '\n' + MARKER;
+                  const others = retained.filter(function (x) { return x !== f; });
+                  const usedBy = others.length
+                    ? 'already used by ' + others.map(function (x) { return '`' + x + '`'; }).join(', ')
+                    : 'used by more than one file in this PR';
+                  const body = mkBody(
+                    '**Duplicate `awa-articleGuid`** \u2014 `' + guid + '` is ' + usedBy
+                      + '. Each article needs its own unique GUID.',
+                    'awa-articleGuid: ' + newGuid);
                   items.push({ file: f, line: gl, body: body });
                 }
               }
@@ -592,3 +692,54 @@ jobs:
               }
             }
             core.info('Posted ' + posted + ' inline suggestion(s), ' + fallback + ' fallback comment(s).');
+
+      - name: GUID check results summary
+        if: always()
+        env:
+          MISSING_OUTCOME: ${{ steps.missing.outcome }}
+          DUPES_OUTCOME: ${{ steps.check.outcome }}
+          CHANGED_OUTCOME: ${{ steps.changed.outcome }}
+        run: |
+          LC_ALL=C
+          export LC_ALL
+
+          # Count non-empty lines in a results file (0 if the file was never created).
+          count_lines() { if [ -f "$1" ]; then awk 'NF' "$1" | wc -l | tr -d ' '; else echo 0; fi; }
+          MISSING=$(count_lines /tmp/missing_guids.txt)
+          CHANGED=$(count_lines /tmp/changed_guids.txt)
+
+          # Duplicate files needing a new GUID = sum over dupe groups of (files in group - 1 owner).
+          DUPES=0
+          if [ -f /tmp/dupes.txt ]; then
+            while IFS=$'\t' read -r _guid files; do
+              n=$(printf '%s' "$files" | tr '|' '\n' | awk 'NF' | wc -l | tr -d ' ')
+              if [ "$n" -gt 1 ]; then DUPES=$((DUPES + n - 1)); fi
+            done < /tmp/dupes.txt
+          fi
+
+          # Result cell: ":heavy_minus_sign: Not run" if the step was skipped, ":x: Fail"
+          # if it flagged files, otherwise ":white_check_mark: Pass".
+          result() {
+            if [ "$1" = "skipped" ]; then printf ':heavy_minus_sign: Not run';
+            elif [ "${2:-0}" -gt 0 ]; then printf ':x: Fail';
+            else printf ':white_check_mark: Pass'; fi
+          }
+
+          TOTAL=$((MISSING + DUPES + CHANGED))
+          if [ "$TOTAL" -gt 0 ]; then
+            OVERALL=":x: **Failed** - resolve the $TOTAL flagged file(s). See the inline review comments for the suggested fix on each."
+          else
+            OVERALL=":white_check_mark: **Passed** - all article GUIDs are present and unique."
+          fi
+
+          {
+            echo "# GUID check results"
+            echo ""
+            echo "$OVERALL"
+            echo ""
+            echo "| Check | Result | Files |"
+            echo "| --- | :---: | ---: |"
+            echo "| Missing GUID | $(result "$MISSING_OUTCOME" "$MISSING") | $MISSING |"
+            echo "| Duplicate GUID | $(result "$DUPES_OUTCOME" "$DUPES") | $DUPES |"
+            echo "| Changed / removed GUID (disallowed) | $(result "$CHANGED_OUTCOME" "$CHANGED") | $CHANGED |"
+          } >> "$GITHUB_STEP_SUMMARY"
