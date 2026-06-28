@@ -1,133 +1,35 @@
-name: GUID assign
+name: (Deprecated) GUID assign
 
-# Post-merge safety net for awa-articleGuid assignment. New articles should already have a
-# GUID enforced in-PR by Shared-GuidCheck; this workflow only acts on anything that slipped
-# through. Because the protected branch blocks direct pushes ("changes via PR"), assignments
-# are delivered as a follow-up PR rather than a push to the branch.
+# DEPRECATED — no-op.
 #
-# Caveat: when AccessToken is a GITHUB_TOKEN-style token, the follow-up PR it opens does not
-# trigger further `on: pull_request` checks, so auto-merge can stall and the PR may need a
-# manual merge. This path is expected to be rare.
+# This post-merge awa-articleGuid assignment approach was abandoned: a workflow can't write to a
+# contributor's fork, and the protected-branch / "changes via PR" rules block the follow-up-PR
+# workaround in practice. GUID presence and uniqueness are now enforced in-PR by Shared-GuidCheck.
+#
+# This file is intentionally a valid no-op that still accepts (and ignores) the inputs/secrets
+# existing callers pass, so those callers don't fail with "Invalid workflow file". Remove the
+# GuidAssign caller workflow from the calling repos when convenient, then delete this file.
 
 on:
   workflow_call:
+    # Declared as optional and ignored — present only so existing callers that still pass them
+    # (or that have removed them) both remain valid.
     inputs:
       PayloadJson:
-        required: true
+        required: false
         type: string
     secrets:
       AccessToken:
-        required: true
+        required: false
 
-permissions:
-  contents: write
-  pull-requests: write
+# Requests no permissions, so this is callable from any repo regardless of how its org policy
+# caps the caller's GITHUB_TOKEN.
+permissions: {}
 
 jobs:
-  assign-guids:
-    # Temporarily disabled (no-op). Restore by changing this back to:
-    #   if: github.repository_owner == 'MicrosoftDocs'
+  noop:
+    # Never runs. Kept as a valid, skipped job so the workflow file parses and callers succeed.
     if: false
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout main
-        uses: actions/checkout@v5
-        with:
-          fetch-depth: 2
-          token: ${{ secrets.AccessToken }}
-
-      - name: Assign GUIDs to new markdown files
-        run: |
-          # Find files added or modified in the merge commit
-          NEW_FILES=$(git diff --name-only --diff-filter=AM HEAD~1...HEAD -- '*.md' '**/*.md')
-
-          if [ -z "$NEW_FILES" ]; then
-            echo "No new articles in this push."
-            echo "guid_changed=0" >> "$GITHUB_ENV"
-            echo "# GUID assignment report" >> "$GITHUB_STEP_SUMMARY"
-            echo "" >> "$GITHUB_STEP_SUMMARY"
-            echo "No new or modified articles found in this push." >> "$GITHUB_STEP_SUMMARY"
-            exit 0
-          fi
-
-          CHANGED=0
-          SUMMARY_ROWS=""
-          while IFS= read -r file; do
-            # Skip files without frontmatter
-            if ! head -1 "$file" | sed 's/^\xEF\xBB\xBF//' | tr -d '\r' | grep -q '^---$'; then
-              echo "Skipping $file (no frontmatter)"
-              SUMMARY_ROWS="${SUMMARY_ROWS}| \`${file}\` | — | Skipped (no frontmatter) |\n"
-              continue
-            fi
-
-            # Skip includes directory
-            if echo "$file" | grep -q '/includes/'; then
-              echo "Skipping $file (includes directory)"
-              SUMMARY_ROWS="${SUMMARY_ROWS}| \`${file}\` | — | Skipped (includes directory) |\n"
-              continue
-            fi
-
-            # Extract awa-articleGuid line from frontmatter
-            GUID_LINE=$(sed '1s/^\xEF\xBB\xBF//' "$file" | tr -d '\r' | sed -n '2,/^---$/p' | grep -i '^awa-articleGuid:' || true)
-
-            if [ -z "$GUID_LINE" ]; then
-              # No awa-articleGuid field — insert one before the closing ---
-              NEW_UUID=$(uuidgen | tr '[:upper:]' '[:lower:]')
-              CLOSE_LINE=$(sed '1s/^\xEF\xBB\xBF//' "$file" | tr -d '\r' | awk '/^---$/{count++; if(count==2){print NR; exit}}')
-              sed -i "${CLOSE_LINE}i\\awa-articleGuid: ${NEW_UUID}" "$file"
-              echo "Assigned GUID $NEW_UUID to $file (field was missing)"
-              git add -- "$file"
-              CHANGED=1
-              SUMMARY_ROWS="${SUMMARY_ROWS}| \`${file}\` | \`${NEW_UUID}\` | Assigned (field was missing) |\n"
-            else
-              # Field exists — check if value is empty
-              GUID_VALUE=$(echo "$GUID_LINE" | sed 's/^[Aa][Ww][Aa]-[Aa][Rr][Tt][Ii][Cc][Ll][Ee][Gg][Uu][Ii][Dd]:[[:space:]]*//' | tr -d '[:space:]')
-              if [ -z "$GUID_VALUE" ]; then
-                NEW_UUID=$(uuidgen | tr '[:upper:]' '[:lower:]')
-                sed -i "s/^[Aa][Ww][Aa]-[Aa][Rr][Tt][Ii][Cc][Ll][Ee][Gg][Uu][Ii][Dd]:.*/awa-articleGuid: ${NEW_UUID}/" "$file"
-                echo "Assigned GUID $NEW_UUID to $file (field was empty)"
-                git add -- "$file"
-                CHANGED=1
-                SUMMARY_ROWS="${SUMMARY_ROWS}| \`${file}\` | \`${NEW_UUID}\` | Assigned (field was empty) |\n"
-              else
-                echo "File $file already has GUID: $GUID_VALUE"
-                SUMMARY_ROWS="${SUMMARY_ROWS}| \`${file}\` | \`${GUID_VALUE}\` | Already assigned |\n"
-              fi
-            fi
-          done <<< "$NEW_FILES"
-
-          # Write job summary
-          echo "# GUID assignment report" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "| File | GUID | Status |" >> "$GITHUB_STEP_SUMMARY"
-          echo "|------|------|--------|" >> "$GITHUB_STEP_SUMMARY"
-          echo -e "$SUMMARY_ROWS" >> "$GITHUB_STEP_SUMMARY"
-
-          echo "guid_changed=$CHANGED" >> "$GITHUB_ENV"
-
-      - name: Open follow-up PR with GUID assignments
-        if: env.guid_changed == '1'
-        env:
-          GH_TOKEN: ${{ secrets.AccessToken }}
-        run: |
-          BASE="${{ github.ref_name }}"
-          BRANCH="auto-guid-assign/${{ github.run_id }}-${{ github.run_attempt }}"
-
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-          # The direct push to the protected branch is blocked by the "changes via PR" rule,
-          # so deliver the GUID assignments on a new branch and open a follow-up PR instead.
-          git checkout -b "$BRANCH"
-          git commit -m "Auto-assign awa-articleGuid to new articles"
-          git push origin "$BRANCH"
-
-          PR_URL=$(gh pr create \
-            --base "$BASE" \
-            --head "$BRANCH" \
-            --title "Auto-assign awa-articleGuid to new articles" \
-            --body "This automated PR adds an \`awa-articleGuid\` to new articles that were merged into \`${BASE}\` without one. Generated by the GUID assign workflow.")
-
-          echo "Opened follow-up PR: $PR_URL"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "Opened follow-up PR with GUID assignments: $PR_URL" >> "$GITHUB_STEP_SUMMARY"
+      - run: echo "Shared-GuidAssign is deprecated and does nothing. See Shared-GuidCheck."
