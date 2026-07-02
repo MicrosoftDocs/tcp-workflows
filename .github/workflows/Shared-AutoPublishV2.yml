@@ -601,6 +601,7 @@ jobs:
                         PullNumber = $PullNumber
                         QueryResponse = $null
                         MutationResponse = $null
+                        DirectMergeResponse = $null
                         TimedOut = $false
                         ManualMergeRequired = $null
                     }
@@ -621,16 +622,53 @@ jobs:
                 
                         Switch ($State) {
                             'MERGEABLE' {
-                
+
                                 $MutationBody = @{ query = $mutation; variables = @{ id = $Node; method = "MERGE" } } | ConvertTo-Json -Depth 3
-                
+
                                 Write-Host "Attempting to enable automerge for #$PullNumber"
-                
+
                                 $MutationResponse = Invoke-RestMethod "https://api.github.com/graphql" -Method Post -Headers $AppGitHubAccessHeaders -Body $MutationBody
-                
+
                                 # Add MutationResponse to result object to return to calling statement
                                 $Result.MutationResponse = $MutationResponse
-                
+
+                                # When a repo has no required status checks, a mergeable PR is already in a
+                                # "clean" state and GitHub rejects enablePullRequestAutoMerge with an
+                                # UNPROCESSABLE "Pull request is in clean status" error. Auto-merge only
+                                # applies when there are pending required checks to wait on. In that case,
+                                # merge the PR directly instead.
+                                $CleanStatusError = $MutationResponse.errors | Where-Object { $_.type -eq "UNPROCESSABLE" -and $_.message -match "clean status" }
+
+                                If ($CleanStatusError) {
+
+                                    Write-Host "PR #$PullNumber is in a clean status (no required checks pending). Merging directly."
+
+                                    Try {
+
+                                        $MergeBody = @{ merge_method = "merge" } | ConvertTo-Json
+
+                                        $DirectMergeResponse = Invoke-RestMethod "https://api.github.com/repos/$Organization/$Repository/pulls/$PullNumber/merge" -Method Put -Headers $AppGitHubAccessHeaders -Body $MergeBody -ErrorAction Stop
+
+                                        $Result.DirectMergeResponse = $DirectMergeResponse
+
+                                        If ($DirectMergeResponse.merged) {
+
+                                            Write-Host "PR #$PullNumber was merged directly. $($DirectMergeResponse.message)"
+
+                                            $Result.ManualMergeRequired = $False
+
+                                            Return $Result
+
+                                        }
+
+                                    } Catch {
+
+                                        Write-Host "Direct merge of PR #$PullNumber failed. Error: $_"
+
+                                    }
+
+                                }
+
                             }
                             'CONFLICTING' {
                 
