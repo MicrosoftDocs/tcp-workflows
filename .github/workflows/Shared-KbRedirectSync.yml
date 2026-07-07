@@ -110,6 +110,7 @@ jobs:
               'enduser-servicing-azure-pr'      = @{ 'Azure' = '/servicing/azure' }
               'enduser-servicing-biztalk-pr'    = @{ 'BizTalk-Server' = '/servicing/biztalk' }
               'enduser-servicing-dynamics-pr'   = @{ 'Dynamics' = '/servicing/dynamics' }
+              'enduser-servicing-exchange-pr'   = @{ 'Exchange' = '/servicing/exchange' }
               'enduser-servicing-his-pr'        = @{ 'Host-Integration-Server' = '/servicing/host-integration-server' }
               'enduser-servicing-pr'            = @{
                   'Internet-Information-Server' = '/servicing/internet-information-server'
