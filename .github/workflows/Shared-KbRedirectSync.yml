@@ -224,6 +224,43 @@ jobs:
               }
           }
 
+          # ---------------------------------------------------------------
+          # De-duplicate against the pre-existing shared redirect files. The
+          # Learn publishing system rejects the same source_path_from_root
+          # (redirect id) appearing in more than one redirection file. The
+          # redirects we just generated for this docset take precedence, so
+          # remove any matching ids from these files. Modified files are
+          # picked up by the commit step below and included in the PR.
+          # ---------------------------------------------------------------
+          $NewSources = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+          foreach ($Redirect in $Redirections) { [void]$NewSources.Add($Redirect.source_path_from_root) }
+
+          $DedupeFiles = @(
+              '.openpublishing.redirection.kb-c3-legacy.json'
+              '.openpublishing.redirection.kb.json'
+          )
+          $SiterootRoot = (Resolve-Path 'siteroot').Path
+          foreach ($DedupeFile in $DedupeFiles) {
+              $LegacyPath = Join-Path $SiterootRoot (Join-Path 'KB-Redirects' $DedupeFile)
+              if (-not (Test-Path $LegacyPath)) {
+                  Write-Host "::warning::Redirect file not found at $LegacyPath; skipping duplicate cleanup."
+                  continue
+              }
+
+              $LegacyJson = Get-Content -Raw -LiteralPath $LegacyPath | ConvertFrom-Json
+              $LegacyEntries = @($LegacyJson.redirections)
+              $Kept = @($LegacyEntries | Where-Object { -not $NewSources.Contains($_.source_path_from_root) })
+              $RemovedCount = $LegacyEntries.Count - $Kept.Count
+
+              if ($RemovedCount -gt 0) {
+                  $LegacyOut = @{ redirections = @($Kept) } | ConvertTo-Json -Depth 5
+                  $LegacyOut | Set-Content -LiteralPath $LegacyPath -Encoding utf8
+                  Write-Host "Removed $RemovedCount duplicate redirect id(s) from $DedupeFile (superseded by '$DocsetName' redirects)."
+              } else {
+                  Write-Host "No duplicate redirect ids found in $DedupeFile."
+              }
+          }
+
       - name: Commit and push topic branch
         id: commit
         shell: pwsh
