@@ -46,10 +46,7 @@ jobs:
         if: |
             github.repository_owner == 'MicrosoftDocs' &&
             contains(github.event.repository.topics, 'build') &&
-            (
-                (github.event_name == 'issue_comment' && github.event.issue.pull_request != null) ||
-                (github.event_name == 'pull_request' && github.event.pull_request.merged == true && github.event.pull_request.base.ref == github.event.repository.default_branch && contains(github.event.pull_request.labels.*.name, 'OnDemandPublish'))
-            )
+            github.event_name == 'issue_comment' && github.event.issue.pull_request != null
         runs-on: ubuntu-latest
         steps:
 
@@ -70,10 +67,10 @@ jobs:
 
                 TrackingRepoOrganization: MicrosoftDocs        # Repo where tracking issues are created for PubOps to review on-demand publishing activity.
                 TrackingRepoName: tcp-mgmt-pr
-                OnDemandLabel: OnDemandPublish                 # Same label used on both caller PRs (presence triggers merge-handler AutoPublish dispatch) and tracking issues (for PubOps filtering).
+                OnDemandLabel: OnDemandPublish                 # Same label on opted-in caller PRs (PubOps/documentary marking) and on tracking issues (for PubOps filtering).
                 OnDemandLabelColor: "5319E7"                   # Quoted to prevent YAML from parsing as scientific notation (5319e7 = 53190000000).
                 OnDemandLabelDescription: On-demand self publishing activity. Applied to opted-in pull requests and to tracking issues in MicrosoftDocs/tcp-mgmt-pr.
-                AutoPublishWorkflowFile: AutoPublish.yml       # Filename of the caller repo's AutoPublish workflow. Dispatched on merge or by #request-publish.
+                AutoPublishWorkflowFile: AutoPublish.yml       # Filename of the caller repo's AutoPublish workflow. Dispatched by the #self-merge and #request-publish commands.
 
                 AccessToken: ${{ secrets.AccessToken }}
                 AppGitHubAccessToken: ${{ steps.app-token.outputs.token }}
@@ -147,34 +144,19 @@ jobs:
                 # TEMPORARY: also allow "max-cpub-test" so the bot path can be exercised end-to-end. Remove before production.
                 $IsServicingRepo = $Repository.StartsWith($ServicingRepoPrefix) -or $Repository -ieq "max-cpub-test"
 
-                # Event-driven variables. Populated from whichever event payload triggered this run.
+                # Event-driven variables. This workflow runs only on issue_comment events (a #self-merge /
+                # #request-publish command on a PR); the caller subscribes to no other event.
                 $EventName = $GitHubData.event_name
 
-                If ($EventName -eq "issue_comment") {
-
-                    # PR comment event variables (source: issue_comment event)
-                    $CommentBody = $GitHubData.event.comment.body
-                    $Submitter = $GitHubData.event.comment.user.login
-                    $SubmitterType = $GitHubData.event.comment.user.type
-                    $IssueUrl = $GitHubData.event.issue.url
-                    $IssueHtmlUrl = $GitHubData.event.issue.html_url
-                    $PrNumber = $GitHubData.event.issue.number
-                    $PrTitle = $GitHubData.event.issue.title
-                    $PrApiUrl = $GitHubData.event.issue.pull_request.url
-
-                } ElseIf ($EventName -eq "pull_request") {
-
-                    # PR merge event variables (source: pull_request.closed event with merged=true)
-                    $CommentBody = $Null
-                    $Submitter = $GitHubData.event.pull_request.merged_by.login
-                    $SubmitterType = $GitHubData.event.pull_request.merged_by.type
-                    $IssueUrl = $GitHubData.event.pull_request.issue_url
-                    $IssueHtmlUrl = $GitHubData.event.pull_request.html_url
-                    $PrNumber = $GitHubData.event.pull_request.number
-                    $PrTitle = $GitHubData.event.pull_request.title
-                    $PrApiUrl = $GitHubData.event.pull_request.url
-
-                }
+                # PR comment event variables (source: issue_comment event)
+                $CommentBody = $GitHubData.event.comment.body
+                $Submitter = $GitHubData.event.comment.user.login
+                $SubmitterType = $GitHubData.event.comment.user.type
+                $IssueUrl = $GitHubData.event.issue.url
+                $IssueHtmlUrl = $GitHubData.event.issue.html_url
+                $PrNumber = $GitHubData.event.issue.number
+                $PrTitle = $GitHubData.event.issue.title
+                $PrApiUrl = $GitHubData.event.issue.pull_request.url
 
                 # Bot submitters comment as "<app-slug>[bot]" with user.type == "Bot". Strip the "[bot]" suffix for the slug lookup.
                 $IsBotSubmitter = ($SubmitterType -eq "Bot") -or ($Submitter -match '\[bot\]$')
@@ -202,8 +184,6 @@ jobs:
                 $AlreadyMergedResponse = "${MentionPrefix}This pull request has already been merged. Use ``$RequestPublishCommand`` to trigger a publish."
                 $PublishTriggeredResponse = "${MentionPrefix}We've triggered AutoPublish. Changes will be published to the ``$TargetBranch`` branch shortly."
                 $PublishFailedResponse = "${MentionPrefix}We couldn't trigger AutoPublish. Try again or contact PubOps.`n`nIf you have questions, post a message to https://aka.ms/tcphelp."
-                $AutoPublishTriggeredOnMergeResponse = "This pull request has merged. We've triggered AutoPublish automatically. Changes will be published to the ``$TargetBranch`` branch shortly."
-                $AutoPublishFailedOnMergeResponse = "This pull request has merged but we couldn't trigger AutoPublish automatically. Use ``$RequestPublishCommand`` on this PR to retry, or wait for the next scheduled publish run.`n`nIf you have questions, post a message to https://aka.ms/tcphelp."
 
                 #####################
                 # After-hours scenario response messages
@@ -969,14 +949,11 @@ jobs:
 
                         [string]$TrackingIssueUrl,
                         [string]$Action,
-                        [string]$Scenario,
-                        [string]$SubmitterOverride
+                        [string]$Scenario
 
                     )
 
-                    # The merge handler passes SubmitterOverride to credit the original #self-merge submitter
-                    # rather than the App that actually executed the merge.
-                    $EffectiveSubmitter = If ([string]::IsNullOrWhiteSpace($SubmitterOverride)) { $Submitter } Else { $SubmitterOverride }
+                    $EffectiveSubmitter = $Submitter
 
                     $CommentBody = "- **Action**: $Action`n" +
                                    "- **Scenario**: $Scenario`n" +
@@ -1131,62 +1108,6 @@ jobs:
                 }
 
                 Write-Host "Event: $EventName. PR #$PrNumber ($Organization/$Repository). AfterHoursEnabled: $AfterHoursEnabled. ServicingEnabled: $ServicingEnabled. IsServicingRepo: $IsServicingRepo. IsBotSubmitter: $IsBotSubmitter."
-
-                #####################
-                # Merge handler
-
-                # Fires on pull_request.closed with merged=true and the OnDemandPublish label present. The job-level `if:`
-                # already verified those preconditions, so no further gates are required - the partner's intent was captured
-                # at #self-merge time. Auto-trigger AutoPublish so the merged content publishes without the partner having to
-                # come back and run #request-publish manually. #request-publish remains as a fallback if this auto-trigger fails.
-                If ($EventName -eq "pull_request") {
-
-                    # Look up the existing tracking issue (created at #self-merge time) and recover the original
-                    # scenario + submitter from its body. Falls back to "Unknown" / merged_by if no issue exists
-                    # (e.g. manual-label edge case where the PR never went through #self-merge).
-                    $TitleMarker = "[OnDemandPublish] $Organization/$Repository#$PrNumber"
-                    $ExistingTrackingIssue = Get-TrackingIssue -TitleMarker $TitleMarker
-
-                    $MergeScenario = "Unknown"
-                    $OriginalSubmitter = $Submitter
-
-                    If ($ExistingTrackingIssue -and $ExistingTrackingIssue.body) {
-                        If ($ExistingTrackingIssue.body -match '(?m)^- \*\*Scenario\*\*:\s*(\S+)') { $MergeScenario = $Matches[1] }
-                        If ($ExistingTrackingIssue.body -match '(?m)^- \*\*Submitter\*\*:\s*@([^\s]+)') { $OriginalSubmitter = $Matches[1] }
-                        Write-Host "Recovered from existing tracking issue: Scenario=$MergeScenario, Submitter=$OriginalSubmitter."
-                    } Else {
-                        Write-Host "No existing tracking issue for PR #$PrNumber. Using Scenario=Unknown, Submitter=$Submitter (merged_by)."
-                    }
-
-                    Write-Host "Self-merge PR #$PrNumber has merged. Triggering AutoPublish workflow."
-
-                    $Triggered = Invoke-AutoPublish
-
-                    If ($Triggered) {
-
-                        Add-PrComment -IssueUrl $IssueUrl -Body $AutoPublishTriggeredOnMergeResponse
-                        $ActionTaken = "PR merged. AutoPublish triggered automatically."
-
-                    } Else {
-
-                        Add-PrComment -IssueUrl $IssueUrl -Body $AutoPublishFailedOnMergeResponse
-                        $ActionTaken = "PR merged. Failed to trigger AutoPublish automatically. Use ``$RequestPublishCommand`` to retry."
-
-                    }
-
-                    If ($ExistingTrackingIssue) {
-
-                        Update-TrackingIssue -TrackingIssueUrl $ExistingTrackingIssue.url -Action $ActionTaken -Scenario $MergeScenario -SubmitterOverride $OriginalSubmitter
-
-                    } Else {
-
-                        New-TrackingIssue -TitleMarker $TitleMarker -Action $ActionTaken -Scenario $MergeScenario | Out-Null
-
-                    }
-
-                    Return
-
-                }
 
                 #####################
                 # Command handler
@@ -1365,8 +1286,8 @@ jobs:
 
                         }
 
-                        # Apply the OnDemandPublish label so the pull_request.closed event carries it and the merge handler
-                        # can identify this PR for AutoPublish dispatch. Ensure the label exists on the repo first.
+                        # Apply the OnDemandPublish label to mark this PR as on-demand publishing activity (PubOps
+                        # visibility). Ensure the label exists on the repo first.
                         If (!(Test-RepoLabel -RepoUri $RepoLabelUrl -Name $OnDemandLabel)) {
 
                             New-RepoLabel -RepoUri $RepoLabelUrl -Name $OnDemandLabel -Color $OnDemandLabelColor -Description $OnDemandLabelDescription
@@ -1381,8 +1302,27 @@ jobs:
 
                         If ($MergeResult.Success) {
 
-                            Add-PrComment -IssueUrl $IssueUrl -Body $MergeSucceededResponse
-                            $ActionTaken = "Merged via ``$SelfMergeCommand`` command. ``$OnDemandLabel`` label applied; AutoPublish will trigger automatically on merge."
+                            # Trigger AutoPublish directly from the command (issue_comment) context rather than relying on the
+                            # pull_request.closed merge handler. Fork PRs - the common case - gate their pull_request workflow
+                            # runs behind approval (action_required) and don't receive secrets, so the merge handler can't
+                            # reliably fire for them. The command context isn't gated and has the App secrets, so dispatch
+                            # AutoPublish here to take the merged content from the default branch to live in a single command.
+                            Write-Host "PR #$PrNumber merged via $SelfMergeCommand. Triggering AutoPublish workflow."
+
+                            $Triggered = Invoke-AutoPublish
+
+                            If ($Triggered) {
+
+                                Add-PrComment -IssueUrl $IssueUrl -Body $MergeSucceededResponse
+                                $ActionTaken = "Merged via ``$SelfMergeCommand`` command. ``$OnDemandLabel`` label applied; AutoPublish triggered automatically."
+
+                            } Else {
+
+                                $TriggerFailedBody = "${MentionPrefix}We've merged this pull request, but we couldn't trigger AutoPublish automatically. Post ``$RequestPublishCommand`` on this PR to retry, or wait for the next scheduled publish run.`n`nIf you have questions, post a message to https://aka.ms/tcphelp."
+                                Add-PrComment -IssueUrl $IssueUrl -Body $TriggerFailedBody
+                                $ActionTaken = "Merged via ``$SelfMergeCommand`` command. ``$OnDemandLabel`` label applied; failed to trigger AutoPublish. Use ``$RequestPublishCommand`` to retry."
+
+                            }
 
                         } Else {
 

@@ -12,6 +12,13 @@ on:
 
   workflow_dispatch:
 
+# Serialize publish runs per repo so the command-driven dispatch (from the #self-merge /
+# #request-publish commands in OnDemandPublish) and a scheduled run can't race into two
+# concurrent main->live PRs. Queue rather than cancel so an in-flight publish always completes.
+concurrency:
+  group: autopublish-${{ github.repository }}
+  cancel-in-progress: false
+
 jobs:
 
   config:

@@ -353,6 +353,30 @@ jobs:
                       $Enabled = $true
                       break
                   }
+
+                  # When the siteroot repo has no required status checks, a mergeable PR is already in a
+                  # "clean" state and GitHub rejects enablePullRequestAutoMerge with an UNPROCESSABLE
+                  # "Pull request is in clean status" error - auto-merge only applies when there are pending
+                  # required checks to wait on. Merge the PR directly with SQUASH in that case (the target
+                  # branch ruleset permits squash only). Same fallback as Shared-AutoPublishV2. This merges
+                  # into the same base branch auto-merge would have, so there is no behavioural difference
+                  # once required checks are added later - the fallback simply stops firing.
+                  $CleanStatusError = $Resp.errors | Where-Object { $_.type -eq "UNPROCESSABLE" -and $_.message -match "clean status" }
+                  if ($CleanStatusError) {
+                      Write-Host "PR #$PrNumber is in a clean status (no required checks pending). Merging directly with squash."
+                      try {
+                          $MergeBody = @{ merge_method = "squash" } | ConvertTo-Json
+                          $DirectMerge = Invoke-RestMethod -Uri "https://api.github.com/repos/$SiterootRepo/pulls/$PrNumber/merge" -Method Put -Headers $Headers -Body $MergeBody -ErrorAction Stop
+                          if ($DirectMerge.merged) {
+                              Write-Host "PR #$PrNumber was merged directly. $($DirectMerge.message)"
+                              $Enabled = $true
+                              break
+                          }
+                      } catch {
+                          Write-Host "Direct merge of PR #$PrNumber failed: $_"
+                      }
+                  }
+
                   Write-Host "Auto-merge not yet enabled (attempt $i). Response:`n$($Resp | ConvertTo-Json -Depth 10)"
               } catch {
                   Write-Host "Auto-merge attempt $i failed: $_"
