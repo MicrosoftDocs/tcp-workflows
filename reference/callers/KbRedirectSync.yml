@@ -1,0 +1,25 @@
+name: Sync KB redirects
+
+permissions:
+  contents: read
+
+on:
+  push:
+    branches: [live]
+
+# Mirror the shared workflow's grouping so subsequent live commits queue and
+# each run completes (no cancellation) to avoid colliding redirect syncs.
+concurrency:
+  group: kb-redirect-sync-${{ github.repository }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  sync-redirects:
+    name: Sync KB redirects
+    if: github.repository_owner == 'MicrosoftDocs'
+    uses: MicrosoftDocs/tcp-workflows/.github/workflows/Shared-KbRedirectSync.yml@main
+    with:
+      PayloadJson: ${{ toJSON(github) }}
+    secrets:
+      PrivateKey: ${{ secrets.M365_APP_PRIVATE_KEY }}
+      ClientId: ${{ secrets.M365_APP_CLIENT_ID }}
