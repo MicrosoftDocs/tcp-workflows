@@ -17,7 +17,7 @@ jobs:
   sync-redirects:
     name: Sync KB redirects
     if: github.repository_owner == 'MicrosoftDocs'
-    uses: MicrosoftDocs/tcp-workflows/.github/workflows/Shared-KbRedirectSync.yml@main
+    uses: MicrosoftDocs/tcp-workflows/.github/workflows/Shared-KbRedirectSync.yml@workflows-prod
     with:
       PayloadJson: ${{ toJSON(github) }}
     secrets:
