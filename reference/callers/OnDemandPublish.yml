@@ -12,8 +12,14 @@ on:
 
 jobs:
 
+  # Pre-filter: only run when the comment contains a "#trusted-" command token, so the ~99% of PR
+  # comments without a command never start a runner.
   config:
-    if: github.repository_owner == 'MicrosoftDocs' && contains(github.event.repository.topics, 'build')
+    if: >-
+      github.repository_owner == 'MicrosoftDocs'
+      && contains(github.event.repository.topics, 'build')
+      && github.event.issue.pull_request != null
+      && contains(github.event.comment.body, '#trusted-')
     runs-on: ubuntu-latest
     outputs:
       EnableAfterHoursPublish: ${{ steps.read.outputs.EnableAfterHoursPublish }}
@@ -36,8 +42,13 @@ jobs:
           "ServicingAuthorizedTeam=$($Config.ServicingAuthorizedTeam)" >> $Env:GITHUB_OUTPUT
           "ServicingAuthorizedApps=$(($Config.ServicingAuthorizedApps -join ','))" >> $Env:GITHUB_OUTPUT
 
+  # Same "#trusted-" prefix gate as above.
   on-demand-publish:
-    if: github.repository_owner == 'MicrosoftDocs' && contains(github.event.repository.topics, 'build')
+    if: >-
+      github.repository_owner == 'MicrosoftDocs'
+      && contains(github.event.repository.topics, 'build')
+      && github.event.issue.pull_request != null
+      && contains(github.event.comment.body, '#trusted-')
     needs: config
     uses: MicrosoftDocs/tcp-workflows/.github/workflows/Shared-OnDemandPublish.yml@workflows-prod
     with:

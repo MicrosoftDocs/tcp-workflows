@@ -70,7 +70,7 @@ jobs:
                 OnDemandLabel: OnDemandPublish                 # Same label on opted-in caller PRs (PubOps/documentary marking) and on tracking issues (for PubOps filtering).
                 OnDemandLabelColor: "5319E7"                   # Quoted to prevent YAML from parsing as scientific notation (5319e7 = 53190000000).
                 OnDemandLabelDescription: On-demand self publishing activity. Applied to opted-in pull requests and to tracking issues in MicrosoftDocs/tcp-mgmt-pr.
-                AutoPublishWorkflowFile: AutoPublish.yml       # Filename of the caller repo's AutoPublish workflow. Dispatched by the #self-merge and #request-publish commands.
+                AutoPublishWorkflowFile: AutoPublish.yml       # Filename of the caller repo's AutoPublish workflow to dispatch.
 
                 AccessToken: ${{ secrets.AccessToken }}
                 AppGitHubAccessToken: ${{ steps.app-token.outputs.token }}
@@ -144,8 +144,7 @@ jobs:
                 # TEMPORARY: also allow "max-cpub-test" so the bot path can be exercised end-to-end. Remove before production.
                 $IsServicingRepo = $Repository.StartsWith($ServicingRepoPrefix) -or $Repository -ieq "max-cpub-test"
 
-                # Event-driven variables. This workflow runs only on issue_comment events (a #self-merge /
-                # #request-publish command on a PR); the caller subscribes to no other event.
+                # Event-driven variables. This workflow runs only on issue_comment events; the caller subscribes to no other event.
                 $EventName = $GitHubData.event_name
 
                 # PR comment event variables (source: issue_comment event)
@@ -166,10 +165,10 @@ jobs:
                 # to keep the response cleaner. Tracking-issue body still uses "@$Submitter" verbatim (for record-keeping).
                 $MentionPrefix = If ($IsBotSubmitter) { "" } Else { "@$Submitter " }
 
-                # Command constants
-                $SelfMergeCommand = "#self-merge"
-                $RequestPublishCommand = "#request-publish"
-                $SupportedCommands = @($SelfMergeCommand, $RequestPublishCommand)
+                # Command constants. Callers gate on the shared "#trusted-" prefix; keep it in sync with the caller workflow.
+                $MergeCommand = "#trusted-merge"
+                $PublishCommand = "#trusted-publish"
+                $SupportedCommands = @($MergeCommand, $PublishCommand)
 
                 # Scenario tags. Set later based on which gating path the submitter clears.
                 $ScenarioAfterHours = "AfterHours"
@@ -181,7 +180,7 @@ jobs:
                 $WrongBaseBranchResponse = "${MentionPrefix}On-demand self publishing is only available for pull requests targeting the default branch (``$DefaultBranch``). This PR targets a different branch.`n`nIf you have questions, post a message to https://aka.ms/tcphelp."
                 $MergeSucceededResponse = "${MentionPrefix}We've merged this pull request. AutoPublish will be triggered automatically and changes will be published to the ``$TargetBranch`` branch shortly.`n`nIf you have questions, post a message to https://aka.ms/tcphelp."
                 $NotMergedResponse = "${MentionPrefix}This pull request has not been merged. The PR must be merged before a publish can be requested."
-                $AlreadyMergedResponse = "${MentionPrefix}This pull request has already been merged. Use ``$RequestPublishCommand`` to trigger a publish."
+                $AlreadyMergedResponse = "${MentionPrefix}This pull request has already been merged. Use ``$PublishCommand`` to trigger a publish."
                 $PublishTriggeredResponse = "${MentionPrefix}We've triggered AutoPublish. Changes will be published to the ``$TargetBranch`` branch shortly."
                 $PublishFailedResponse = "${MentionPrefix}We couldn't trigger AutoPublish. Try again or contact PubOps.`n`nIf you have questions, post a message to https://aka.ms/tcphelp."
 
@@ -550,8 +549,8 @@ jobs:
                 #####################
                 # Get-PrCommand
 
-                # Commands must start at the beginning of a line and must be the only content on that line. Other lines are ignored.
-                # First matching command wins if multiple are present.
+                # A command must be the only content on its line (leading/trailing whitespace aside); other lines are ignored.
+                # First match wins. Matching is case-insensitive.
                 Function Get-PrCommand {
 
                     [CmdletBinding()]
@@ -770,8 +769,8 @@ jobs:
                 #####################
                 # Merge-PullRequest
 
-                # Merges a PR directly via the REST API using the App token. Used by the #self-merge command after status
-                # checks have been verified as passing. The partner doesn't have direct merge permission; the App token does.
+                # Merges a PR directly via the REST API using the App token, after status checks are verified as passing.
+                # The partner doesn't have direct merge permission; the App token does.
                 Function Merge-PullRequest {
 
                     [CmdletBinding()]
@@ -1203,7 +1202,7 @@ jobs:
 
                 Switch ($Command) {
 
-                    $SelfMergeCommand {
+                    $MergeCommand {
 
                         # Prerequisites depend on scenario:
                         #   AfterHours: in window, authorized, PR targets default branch, not merged, status checks passing.
@@ -1211,7 +1210,7 @@ jobs:
 
                         If ($Null -eq $Scenario) {
 
-                            Write-Host "Submitter $Submitter is not authorized under any applicable scenario. Rejecting $SelfMergeCommand."
+                            Write-Host "Submitter $Submitter is not authorized under any applicable scenario. Rejecting $MergeCommand."
                             Add-PrComment -IssueUrl $IssueUrl -Body $UnauthorizedResponse
                             Break
 
@@ -1224,7 +1223,7 @@ jobs:
 
                             If (!$AfterHours) {
 
-                                Write-Host "Not in after hours. Rejecting $SelfMergeCommand."
+                                Write-Host "Not in after hours. Rejecting $MergeCommand."
                                 Add-PrComment -IssueUrl $IssueUrl -Body $AfterHours_StandardHoursResponse
                                 Break
 
@@ -1236,7 +1235,7 @@ jobs:
 
                         If ($PrData.base.ref -ne $DefaultBranch) {
 
-                            Write-Host "PR #$PrNumber targets `"$($PrData.base.ref)`", not the default branch `"$DefaultBranch`". Rejecting $SelfMergeCommand."
+                            Write-Host "PR #$PrNumber targets `"$($PrData.base.ref)`", not the default branch `"$DefaultBranch`". Rejecting $MergeCommand."
                             Add-PrComment -IssueUrl $IssueUrl -Body $WrongBaseBranchResponse
                             Break
 
@@ -1244,7 +1243,7 @@ jobs:
 
                         If ($PrData.merged) {
 
-                            Write-Host "PR #$PrNumber is already merged. Rejecting $SelfMergeCommand."
+                            Write-Host "PR #$PrNumber is already merged. Rejecting $MergeCommand."
                             Add-PrComment -IssueUrl $IssueUrl -Body $AlreadyMergedResponse
                             Break
 
@@ -1254,8 +1253,8 @@ jobs:
                         # so the merge endpoint never gets called on a draft (which would 405 with "Pull Request is still a draft").
                         If ($PrData.draft) {
 
-                            Write-Host "PR #$PrNumber is a draft. Rejecting $SelfMergeCommand."
-                            $DraftRejectionBody = "${MentionPrefix}We can't merge this pull request yet. The PR is a draft. Mark it as ready for review and post ``$SelfMergeCommand`` again.`n`nIf you have questions, post a message to https://aka.ms/tcphelp."
+                            Write-Host "PR #$PrNumber is a draft. Rejecting $MergeCommand."
+                            $DraftRejectionBody = "${MentionPrefix}We can't merge this pull request yet. The PR is a draft. Mark it as ready for review and post ``$MergeCommand`` again.`n`nIf you have questions, post a message to https://aka.ms/tcphelp."
                             Add-PrComment -IssueUrl $IssueUrl -Body $DraftRejectionBody
                             Break
 
@@ -1278,9 +1277,9 @@ jobs:
                                 "unknown"  { "GitHub hasn't finished computing the mergeable state. Try again in a moment." }
                                 default    { "GitHub reports the PR isn't ready to merge (state: ``$MergeableState``)." }
                             }
-                            $RejectionBody = "${MentionPrefix}We can't merge this pull request yet. $StateExplanation`n`nResolve the issue and post ``$SelfMergeCommand`` again.`n`nIf you have questions, post a message to https://aka.ms/tcphelp."
+                            $RejectionBody = "${MentionPrefix}We can't merge this pull request yet. $StateExplanation`n`nResolve the issue and post ``$MergeCommand`` again.`n`nIf you have questions, post a message to https://aka.ms/tcphelp."
 
-                            Write-Host "PR #$PrNumber mergeable_state is `"$MergeableState`". Rejecting $SelfMergeCommand."
+                            Write-Host "PR #$PrNumber mergeable_state is `"$MergeableState`". Rejecting $MergeCommand."
                             Add-PrComment -IssueUrl $IssueUrl -Body $RejectionBody
                             Break
 
@@ -1307,20 +1306,20 @@ jobs:
                             # runs behind approval (action_required) and don't receive secrets, so the merge handler can't
                             # reliably fire for them. The command context isn't gated and has the App secrets, so dispatch
                             # AutoPublish here to take the merged content from the default branch to live in a single command.
-                            Write-Host "PR #$PrNumber merged via $SelfMergeCommand. Triggering AutoPublish workflow."
+                            Write-Host "PR #$PrNumber merged via $MergeCommand. Triggering AutoPublish workflow."
 
                             $Triggered = Invoke-AutoPublish
 
                             If ($Triggered) {
 
                                 Add-PrComment -IssueUrl $IssueUrl -Body $MergeSucceededResponse
-                                $ActionTaken = "Merged via ``$SelfMergeCommand`` command. ``$OnDemandLabel`` label applied; AutoPublish triggered automatically."
+                                $ActionTaken = "Merged via ``$MergeCommand`` command. ``$OnDemandLabel`` label applied; AutoPublish triggered automatically."
 
                             } Else {
 
-                                $TriggerFailedBody = "${MentionPrefix}We've merged this pull request, but we couldn't trigger AutoPublish automatically. Post ``$RequestPublishCommand`` on this PR to retry, or wait for the next scheduled publish run.`n`nIf you have questions, post a message to https://aka.ms/tcphelp."
+                                $TriggerFailedBody = "${MentionPrefix}We've merged this pull request, but we couldn't trigger AutoPublish automatically. Post ``$PublishCommand`` on this PR to retry, or wait for the next scheduled publish run.`n`nIf you have questions, post a message to https://aka.ms/tcphelp."
                                 Add-PrComment -IssueUrl $IssueUrl -Body $TriggerFailedBody
-                                $ActionTaken = "Merged via ``$SelfMergeCommand`` command. ``$OnDemandLabel`` label applied; failed to trigger AutoPublish. Use ``$RequestPublishCommand`` to retry."
+                                $ActionTaken = "Merged via ``$MergeCommand`` command. ``$OnDemandLabel`` label applied; failed to trigger AutoPublish. Use ``$PublishCommand`` to retry."
 
                             }
 
@@ -1328,7 +1327,7 @@ jobs:
 
                             $MergeFailedBody = "${MentionPrefix}We couldn't merge this pull request.`n`n**GitHub reported**: $($MergeResult.ErrorMessage)`n`nIf you have questions, post a message to https://aka.ms/tcphelp."
                             Add-PrComment -IssueUrl $IssueUrl -Body $MergeFailedBody
-                            $ActionTaken = "Failed to merge via ``$SelfMergeCommand`` command. GitHub: $($MergeResult.ErrorMessage)."
+                            $ActionTaken = "Failed to merge via ``$MergeCommand`` command. GitHub: $($MergeResult.ErrorMessage)."
 
                         }
 
@@ -1336,7 +1335,7 @@ jobs:
 
                     }
 
-                    $RequestPublishCommand {
+                    $PublishCommand {
 
                         # Prerequisites depend on scenario:
                         #   AfterHours: in window, authorized, PR merged.
@@ -1344,7 +1343,7 @@ jobs:
 
                         If ($Null -eq $Scenario) {
 
-                            Write-Host "Submitter $Submitter is not authorized under any applicable scenario. Rejecting $RequestPublishCommand."
+                            Write-Host "Submitter $Submitter is not authorized under any applicable scenario. Rejecting $PublishCommand."
                             Add-PrComment -IssueUrl $IssueUrl -Body $UnauthorizedResponse
                             Break
 
@@ -1357,7 +1356,7 @@ jobs:
 
                             If (!$AfterHours) {
 
-                                Write-Host "Not in after hours. Rejecting $RequestPublishCommand."
+                                Write-Host "Not in after hours. Rejecting $PublishCommand."
                                 Add-PrComment -IssueUrl $IssueUrl -Body $AfterHours_StandardHoursResponse
                                 Break
 
@@ -1369,7 +1368,7 @@ jobs:
 
                         If ($PrData.base.ref -ne $DefaultBranch) {
 
-                            Write-Host "PR #$PrNumber targets `"$($PrData.base.ref)`", not the default branch `"$DefaultBranch`". Rejecting $RequestPublishCommand."
+                            Write-Host "PR #$PrNumber targets `"$($PrData.base.ref)`", not the default branch `"$DefaultBranch`". Rejecting $PublishCommand."
                             Add-PrComment -IssueUrl $IssueUrl -Body $WrongBaseBranchResponse
                             Break
 
@@ -1377,7 +1376,7 @@ jobs:
 
                         If (!$PrData.merged) {
 
-                            Write-Host "PR #$PrNumber is not merged. Rejecting $RequestPublishCommand."
+                            Write-Host "PR #$PrNumber is not merged. Rejecting $PublishCommand."
                             Add-PrComment -IssueUrl $IssueUrl -Body $NotMergedResponse
                             Break
 
@@ -1388,12 +1387,12 @@ jobs:
                         If ($Triggered) {
 
                             Add-PrComment -IssueUrl $IssueUrl -Body $PublishTriggeredResponse
-                            $ActionTaken = "Triggered AutoPublish workflow via ``$RequestPublishCommand`` command."
+                            $ActionTaken = "Triggered AutoPublish workflow via ``$PublishCommand`` command."
 
                         } Else {
 
                             Add-PrComment -IssueUrl $IssueUrl -Body $PublishFailedResponse
-                            $ActionTaken = "Failed to trigger AutoPublish workflow via ``$RequestPublishCommand`` command."
+                            $ActionTaken = "Failed to trigger AutoPublish workflow via ``$PublishCommand`` command."
 
                         }
 
