@@ -411,8 +411,8 @@ jobs:
                         query ($Id: ID!) {
                             node(id: $Id) {
                                 ... on PullRequest {
-                                id
-                                mergeable
+                                    id
+                                    mergeable
                                     commits(last: 1) {
                                         nodes {
                                             commit {
@@ -578,15 +578,15 @@ jobs:
                 Function Enable-GitHubPRAutoMerge {
                     param(
                         [Parameter(Mandatory)]
-                        [int]    $PullNumber,
-                        [int] $MaxRetries = 3
-                        
+                        [int] $PullNumber,
+                        [int] $MaxRetries = 6,
+                        [int] $FallbackTimeoutMinutes = 8
                     )
-                
+
                     # Get the GraphQL node_id for the pull request
                     $Pr   = Invoke-RestMethod "https://api.github.com/repos/$Organization/$Repository/pulls/$PullNumber" -Headers $AppGitHubAccessHeaders
                     $Node = $Pr.node_id
-                
+
                     # GraphQL to submit automerge request to GitHub
                     $Mutation = @"
                         mutation (`$id`: ID!, `$method`: PullRequestMergeMethod!) {
@@ -595,147 +595,154 @@ jobs:
                             ) { pullRequest { autoMergeRequest { enabledAt mergeMethod } } }
                         }
                 "@
-                
-                    # Create a custom object that'll be returned to the calling function
+
+                    # Custom object returned to the calling function
                     $Result = [PSCustomObject]@{
-                        PullNumber = $PullNumber
-                        QueryResponse = $null
-                        MutationResponse = $null
-                        DirectMergeResponse = $null
-                        TimedOut = $false
+                        PullNumber          = $PullNumber
+                        QueryResponse       = $null
+                        MutationResponse    = $null
+                        TimedOut            = $false
                         ManualMergeRequired = $null
                     }
-                    
-                    $MutationResponse = $null
-                
-                    # Exponential back-off: 1,2,4,8,16,32,etc seconds per $MaxRetries 
-                    For ($i = 0; $i -lt $MaxRetries -and $MutationResponse -eq $Null; $i++) {
-                                    
-                        # Check mergeable state
-                        $QueryResponse = Get-PrState -NodeId $Node
-                        $State = $QueryResponse.data.node.mergeable
-                    
-                        # Add QueryResponse to result object to return to calling statement
+
+                    # Bounded deadline for waiting out PENDING checks on repos that do not yet have a
+                    # required status check on the target branch (transition behaviour). Once a required
+                    # check exists, a pending PR is BLOCKED and the native auto-merge path below runs
+                    # instead, so this wait is never reached.
+                    $Deadline = (Get-Date).AddMinutes($FallbackTimeoutMinutes)
+                    $Attempt  = 0
+
+                    While ($True) {
+
+                        $Attempt++
+
+                        $QueryResponse        = Get-PrState -NodeId $Node
                         $Result.QueryResponse = $QueryResponse
-                        
-                        Write-Host "PR #$PullNumber state: $State"
-                
-                        Switch ($State) {
-                            'MERGEABLE' {
+                        $Mergeable            = $QueryResponse.data.node.mergeable
+                        $CheckState           = $QueryResponse.data.node.commits.nodes.commit.statusCheckRollup.state
 
-                                $MutationBody = @{ query = $mutation; variables = @{ id = $Node; method = "MERGE" } } | ConvertTo-Json -Depth 3
+                        Write-Host "PR #$PullNumber attempt $Attempt`: mergeable=$Mergeable checks=$CheckState"
 
-                                Write-Host "Attempting to enable automerge for #$PullNumber"
+                        # GitHub is still computing mergeability - short back-off and retry.
+                        If ($Mergeable -ne "MERGEABLE" -and $Mergeable -ne "CONFLICTING") {
 
-                                $MutationResponse = Invoke-RestMethod "https://api.github.com/graphql" -Method Post -Headers $AppGitHubAccessHeaders -Body $MutationBody
+                            If ($Attempt -ge $MaxRetries) {
 
-                                # Add MutationResponse to result object to return to calling statement
-                                $Result.MutationResponse = $MutationResponse
+                                Write-Host "PR #$PullNumber mergeability still UNKNOWN after $MaxRetries attempts. Manual merge required."
+                                $Result.TimedOut            = $True
+                                $Result.ManualMergeRequired = $True
+                                Return $Result
 
-                                # When a repo has no required status checks, a mergeable PR is already in a
-                                # "clean" state and GitHub rejects enablePullRequestAutoMerge with an
-                                # UNPROCESSABLE "Pull request is in clean status" error. Auto-merge only
-                                # applies when there are pending required checks to wait on. In that case,
-                                # merge the PR directly instead.
-                                $CleanStatusError = $MutationResponse.errors | Where-Object { $_.type -eq "UNPROCESSABLE" -and $_.message -match "clean status" }
+                            }
 
-                                If ($CleanStatusError) {
+                            $Delay = [math]::Min([math]::Pow(2, $Attempt), 30)
+                            Write-Host "mergeable is UNKNOWN (expected while GitHub evaluates the PR). Retry in $Delay s..."
+                            Start-Sleep -Seconds $Delay
+                            Continue
 
-                                    Write-Host "PR #$PullNumber is in a clean status (no required checks pending). Merging directly."
+                        }
 
-                                    Try {
+                        # Conflicts cannot be auto-merged.
+                        If ($Mergeable -eq "CONFLICTING") {
 
-                                        $MergeBody = @{ merge_method = "merge" } | ConvertTo-Json
+                            Write-Host "PR #$PullNumber has conflicts. Manual merge required."
+                            $Result.ManualMergeRequired = $True
+                            Return $Result
 
-                                        $DirectMergeResponse = Invoke-RestMethod "https://api.github.com/repos/$Organization/$Repository/pulls/$PullNumber/merge" -Method Put -Headers $AppGitHubAccessHeaders -Body $MergeBody -ErrorAction Stop
+                        }
 
-                                        $Result.DirectMergeResponse = $DirectMergeResponse
+                        # MERGEABLE - attempt to enable native auto-merge.
+                        $MutationBody = @{ query = $Mutation; variables = @{ id = $Node; method = "MERGE" } } | ConvertTo-Json -Depth 3
 
-                                        If ($DirectMergeResponse.merged) {
+                        Write-Host "Attempting to enable automerge for #$PullNumber"
 
-                                            Write-Host "PR #$PullNumber was merged directly. $($DirectMergeResponse.message)"
+                        $MutationResponse        = Invoke-RestMethod "https://api.github.com/graphql" -Method Post -Headers $AppGitHubAccessHeaders -Body $MutationBody
+                        $Result.MutationResponse = $MutationResponse
 
-                                            $Result.ManualMergeRequired = $False
+                        $AutoMergeEnabledAt = $MutationResponse.data.enablePullRequestAutoMerge.pullRequest.autoMergeRequest.enabledAt
 
-                                            Return $Result
+                        # Native auto-merge queued. This is the steady-state path once the target branch
+                        # has a required status check: a pending check makes the PR BLOCKED, the mutation
+                        # succeeds, and GitHub merges the PR when the check passes.
+                        If ($AutoMergeEnabledAt) {
 
-                                        }
+                            Write-Host "Native auto-merge enabled for PR #$PullNumber at $AutoMergeEnabledAt."
+                            $Result.ManualMergeRequired = $False
+                            Return $Result
 
-                                    } Catch {
+                        }
 
-                                        Write-Host "Direct merge of PR #$PullNumber failed. Error: $_"
+                        $ErrorMessage = ($MutationResponse.errors | Select-Object -First 1).message
+                        Write-Host "enablePullRequestAutoMerge rejected for PR #$PullNumber`: $ErrorMessage"
 
-                                    }
+                        # CLEAN: mergeable with all checks passed (or none exist), so there is no required
+                        # gate for auto-merge to wait on and GitHub rejects with a "clean status" error.
+                        # Merging directly is correct in every case, including after migration.
+                        If ($ErrorMessage -match "clean status") {
+
+                            Write-Host "PR #$PullNumber is in a clean status. Merging directly."
+
+                            Try {
+
+                                $MergeBody           = @{ merge_method = "merge" } | ConvertTo-Json
+                                $DirectMergeResponse = Invoke-RestMethod "https://api.github.com/repos/$Organization/$Repository/pulls/$PullNumber/merge" -Method Put -Headers $AppGitHubAccessHeaders -Body $MergeBody -ErrorAction Stop
+
+                                If ($DirectMergeResponse.merged) {
+
+                                    Write-Host "PR #$PullNumber was merged directly. $($DirectMergeResponse.message)"
+                                    $Result.ManualMergeRequired = $False
+                                    Return $Result
 
                                 }
 
+                            } Catch {
+
+                                Write-Host "Direct merge of PR #$PullNumber failed. Error: $_"
+
                             }
-                            'CONFLICTING' {
-                
-                                Write-Host "PR #$PullNumber has conflicts. Auto-merge not enabled."
-                
-                            }
-                            default {
-                
-                                # Calculate exponential delay based on current attempt
-                                $Delay = [math]::Pow(2, $i)
-                
-                                Write-Host "mergeable is UNKNOWN. This is expected on the first attempt while GitHub evaluates PR. Retry in $Delay s..."
-                
-                                Start-Sleep -Seconds $Delay
-                            }
+
+                            $Result.ManualMergeRequired = $True
+                            Return $Result
+
                         }
 
-                        Write-Host "Query response attempt $i`:`n $($QueryResponse | ConvertTo-Json -Depth 50)"
-                        Write-Host "Mutation response attempt $i`:`n $($MutationResponse | ConvertTo-Json -Depth 50)"
+                        # UNSTABLE: mergeable but checks are non-passing and there is no required gate to
+                        # wait on. Only reachable on repos without a required status check - once one is
+                        # added the PR is BLOCKED and the native path above handles it instead.
+                        If ($ErrorMessage -match "unstable status") {
 
-                    }
-                
-                    If ($i -eq $MaxRetries) {
-                      
-                        $TimedOut = $Result.TimedOut = $true
+                            # Never auto-merge over a failing check.
+                            If ($CheckState -eq "FAILURE" -or $CheckState -eq "ERROR") {
 
-                        Write-Host "Timed out waiting for PR #$PullNumber to become mergeable."
-                
-                    }
+                                Write-Host "PR #$PullNumber has failing checks. Manual merge required."
+                                $Result.ManualMergeRequired = $True
+                                Return $Result
 
-                    # Check if auto-merge was enabled. If enabledAt is not null, it was enabled.
-                    $AutoMergeEnabledAt = $MutationResponse.data.enablePullRequestAutoMerge.pullRequest.autoMergeRequest.enabledAt
+                            }
 
-                    If ($AutoMergeEnabledAt) {
+                            # Checks still pending: wait within the bounded deadline, then re-evaluate.
+                            # When the checks pass the PR becomes CLEAN and merges on the next iteration.
+                            If ((Get-Date) -lt $Deadline) {
 
-                        Write-Host "Auto-merge for PR #$PrNumber was enabled at $AutoMergeEnabledAt."
+                                Write-Host "PR #$PullNumber checks are pending. Waiting 30 s (deadline $Deadline)..."
+                                Start-Sleep -Seconds 30
+                                Continue
 
-                        $Result.ManualMergeRequired = $False
+                            }
 
-                    } Else {
-
-                        Write-Host "Auto-merge for PR #$PrNumber was not enabled. Manual merge required."
-                        
+                            Write-Host "PR #$PullNumber checks still pending after $FallbackTimeoutMinutes min. Manual merge required."
+                            $Result.TimedOut            = $True
                             $Result.ManualMergeRequired = $True
-                        
-                        If ($TimedOut) {
-                        
-                            Write-Host "PR #$PrNumber timed out waiting for mergeable state."
-                            
-                        } Else {
-                        
-                            If ($QueryResponse.data.node.mergeable -eq "CONFLICTING") {
-                                
-                                Write-Host "PR #$PrNumber has conflicts. Auto-merge not enabled."
-                                
-                            } Else {
-                                
-                                Write-Host "PR #$PrNumber wasn't mergeable for an unknown reason. Below is the response:"
-                                Write-Host $($AutoMergeResult | ConvertTo-Json -Depth 20)
-                                
-                            } # QueryResponse.data.node.mergeable
-                            
-                        } # TimedOut
+                            Return $Result
 
-                    } # If AutoMergeEnabledAt
+                        }
 
-                    Return $Result
+                        # Any other rejection reason - surface it and fall back to manual merge.
+                        Write-Host "PR #$PullNumber could not be auto-merged (unhandled reason). Manual merge required."
+                        $Result.ManualMergeRequired = $True
+                        Return $Result
+
+                    }
                 }
 
                 #####################

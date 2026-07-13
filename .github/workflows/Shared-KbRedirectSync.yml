@@ -110,6 +110,7 @@ jobs:
               'enduser-servicing-azure-pr'      = @{ 'Azure' = '/servicing/azure' }
               'enduser-servicing-biztalk-pr'    = @{ 'BizTalk-Server' = '/servicing/biztalk' }
               'enduser-servicing-dynamics-pr'   = @{ 'Dynamics' = '/servicing/dynamics' }
+              'enduser-servicing-exchange-pr'   = @{ 'Exchange' = '/servicing/exchange' }
               'enduser-servicing-his-pr'        = @{ 'Host-Integration-Server' = '/servicing/host-integration-server' }
               'enduser-servicing-pr'            = @{
                   'Internet-Information-Server' = '/servicing/internet-information-server'
@@ -223,6 +224,43 @@ jobs:
               }
           }
 
+          # ---------------------------------------------------------------
+          # De-duplicate against the pre-existing shared redirect files. The
+          # Learn publishing system rejects the same source_path_from_root
+          # (redirect id) appearing in more than one redirection file. The
+          # redirects we just generated for this docset take precedence, so
+          # remove any matching ids from these files. Modified files are
+          # picked up by the commit step below and included in the PR.
+          # ---------------------------------------------------------------
+          $NewSources = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+          foreach ($Redirect in $Redirections) { [void]$NewSources.Add($Redirect.source_path_from_root) }
+
+          $DedupeFiles = @(
+              '.openpublishing.redirection.kb-c3-legacy.json'
+              '.openpublishing.redirection.kb.json'
+          )
+          $SiterootRoot = (Resolve-Path 'siteroot').Path
+          foreach ($DedupeFile in $DedupeFiles) {
+              $LegacyPath = Join-Path $SiterootRoot (Join-Path 'KB-Redirects' $DedupeFile)
+              if (-not (Test-Path $LegacyPath)) {
+                  Write-Host "::warning::Redirect file not found at $LegacyPath; skipping duplicate cleanup."
+                  continue
+              }
+
+              $LegacyJson = Get-Content -Raw -LiteralPath $LegacyPath | ConvertFrom-Json
+              $LegacyEntries = @($LegacyJson.redirections)
+              $Kept = @($LegacyEntries | Where-Object { -not $NewSources.Contains($_.source_path_from_root) })
+              $RemovedCount = $LegacyEntries.Count - $Kept.Count
+
+              if ($RemovedCount -gt 0) {
+                  $LegacyOut = @{ redirections = @($Kept) } | ConvertTo-Json -Depth 5
+                  $LegacyOut | Set-Content -LiteralPath $LegacyPath -Encoding utf8
+                  Write-Host "Removed $RemovedCount duplicate redirect id(s) from $DedupeFile (superseded by '$DocsetName' redirects)."
+              } else {
+                  Write-Host "No duplicate redirect ids found in $DedupeFile."
+              }
+          }
+
       - name: Commit and push topic branch
         id: commit
         shell: pwsh
@@ -303,23 +341,114 @@ jobs:
 
           # Auto-merge with SQUASH. The org ruleset on the target branch permits squash only
           # (merge commits and rebase are disallowed), so SQUASH is the only valid method here.
-          # Retry with backoff while GitHub evaluates the PR's mergeable state (transient nulls).
-          $Enabled = $false
-          for ($i = 0; $i -lt 6 -and -not $Enabled; $i++) {
+          #
+          # Mirrors Enable-GitHubPRAutoMerge in Shared-AutoPublishV2:
+          #  - enablePullRequestAutoMerge succeeds once the base branch has a required status check
+          #    (a pending check makes the PR BLOCKED and native auto-merge queues) - the steady state.
+          #  - "clean status" rejection => mergeable with all checks passed (or none) => merge directly.
+          #  - "unstable status" rejection => no required gate yet; wait out PENDING checks within a
+          #    bounded deadline (a FAILURE never merges), then a pass turns it CLEAN and it merges.
+          # Once a required check exists on the base branch, only the native path is exercised.
+          $StateQuery = @"
+          query (`$id: ID!) {
+            node(id: `$id) {
+              ... on PullRequest {
+                mergeable
+                commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }
+              }
+            }
+          }
+          "@
+
+          $FallbackTimeoutMinutes = 8
+          $Deadline   = (Get-Date).AddMinutes($FallbackTimeoutMinutes)
+          $MaxRetries = 6
+          $Enabled    = $false
+          $Attempt    = 0
+
+          while (-not $Enabled) {
+
+              $Attempt++
+
+              $StateBody = @{ query = $StateQuery; variables = @{ id = $NodeId } } | ConvertTo-Json -Depth 5
+              try {
+                  $StateResp = Invoke-RestMethod -Uri 'https://api.github.com/graphql' -Method POST -Headers $Headers -Body $StateBody
+              } catch {
+                  Write-Host "State query attempt $Attempt failed: $_"
+                  if ($Attempt -ge $MaxRetries) { break }
+                  Start-Sleep -Seconds ([Math]::Min([Math]::Pow(2, $Attempt), 30)); continue
+              }
+
+              $Mergeable  = $StateResp.data.node.mergeable
+              $CheckState = $StateResp.data.node.commits.nodes.commit.statusCheckRollup.state
+              Write-Host "PR #$PrNumber attempt $Attempt`: mergeable=$Mergeable checks=$CheckState"
+
+              if ($Mergeable -eq 'CONFLICTING') {
+                  Write-Host "PR #$PrNumber has conflicts. Manual merge required."
+                  break
+              }
+
+              # GitHub still computing mergeability - short back-off and retry.
+              if ($Mergeable -ne 'MERGEABLE') {
+                  if ($Attempt -ge $MaxRetries) {
+                      Write-Host "PR #$PrNumber mergeability still UNKNOWN after $MaxRetries attempts. Manual merge required."
+                      break
+                  }
+                  Start-Sleep -Seconds ([Math]::Min([Math]::Pow(2, $Attempt), 30)); continue
+              }
+
+              # MERGEABLE - attempt native auto-merge (squash).
               $MutationBody = @{ query = $Mutation; variables = @{ id = $NodeId; method = 'SQUASH' } } | ConvertTo-Json -Depth 5
               try {
                   $Resp = Invoke-RestMethod -Uri 'https://api.github.com/graphql' -Method POST -Headers $Headers -Body $MutationBody
-                  $EnabledAt = $Resp.data.enablePullRequestAutoMerge.pullRequest.autoMergeRequest.enabledAt
-                  if ($EnabledAt) {
-                      Write-Host "Auto-merge (squash) enabled for PR #$PrNumber at $EnabledAt."
-                      $Enabled = $true
+              } catch {
+                  Write-Host "Auto-merge attempt $Attempt failed: $_"
+                  if ($Attempt -ge $MaxRetries) { break }
+                  Start-Sleep -Seconds ([Math]::Min([Math]::Pow(2, $Attempt), 30)); continue
+              }
+
+              $EnabledAt = $Resp.data.enablePullRequestAutoMerge.pullRequest.autoMergeRequest.enabledAt
+              if ($EnabledAt) {
+                  Write-Host "Native auto-merge (squash) enabled for PR #$PrNumber at $EnabledAt."
+                  $Enabled = $true
+                  break
+              }
+
+              $ErrorMessage = ($Resp.errors | Select-Object -First 1).message
+              Write-Host "enablePullRequestAutoMerge rejected for PR #$PrNumber`: $ErrorMessage"
+
+              # CLEAN: mergeable and all checks passed (or none) - no required gate, so merge directly.
+              if ($ErrorMessage -match 'clean status') {
+                  Write-Host "PR #$PrNumber is in a clean status. Merging directly with squash."
+                  try {
+                      $MergeBody   = @{ merge_method = 'squash' } | ConvertTo-Json
+                      $DirectMerge = Invoke-RestMethod -Uri "https://api.github.com/repos/$SiterootRepo/pulls/$PrNumber/merge" -Method Put -Headers $Headers -Body $MergeBody -ErrorAction Stop
+                      if ($DirectMerge.merged) {
+                          Write-Host "PR #$PrNumber was merged directly. $($DirectMerge.message)"
+                          $Enabled = $true
+                      }
+                  } catch {
+                      Write-Host "Direct merge of PR #$PrNumber failed: $_"
+                  }
+                  break
+              }
+
+              # UNSTABLE: mergeable but checks non-passing and no required gate to wait on.
+              if ($ErrorMessage -match 'unstable status') {
+                  if ($CheckState -eq 'FAILURE' -or $CheckState -eq 'ERROR') {
+                      Write-Host "PR #$PrNumber has failing checks. Manual merge required."
                       break
                   }
-                  Write-Host "Auto-merge not yet enabled (attempt $i). Response:`n$($Resp | ConvertTo-Json -Depth 10)"
-              } catch {
-                  Write-Host "Auto-merge attempt $i failed: $_"
+                  if ((Get-Date) -lt $Deadline) {
+                      Write-Host "PR #$PrNumber checks are pending. Waiting 30 s (deadline $Deadline)..."
+                      Start-Sleep -Seconds 30; continue
+                  }
+                  Write-Host "PR #$PrNumber checks still pending after $FallbackTimeoutMinutes min. Manual merge required."
+                  break
               }
-              Start-Sleep -Seconds ([Math]::Pow(2, $i))
+
+              Write-Host "PR #$PrNumber could not be auto-merged (unhandled reason). Manual merge required."
+              break
           }
 
           if (-not $Enabled) {

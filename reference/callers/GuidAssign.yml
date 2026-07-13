@@ -1,0 +1,19 @@
+name: GUID Assign
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '**/*.md'
+
+permissions:
+  contents: write
+
+jobs:
+  assign-guids:
+    if: github.repository_owner == 'MicrosoftDocs'
+    uses: MicrosoftDocs/tcp-workflows/.github/workflows/Shared-GuidAssign.yml@workflows-prod
+    with:
+      PayloadJson: ${{ toJSON(github) }}
+    secrets:
+      AccessToken: ${{ secrets.GITHUB_TOKEN }}
