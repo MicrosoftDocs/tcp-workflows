@@ -1,0 +1,15 @@
+name: GUIDs in PR are unique
+
+permissions:
+  pull-requests: write
+  contents: read
+
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize]
+
+jobs:
+  guid-check:
+    uses: MicrosoftDocs/tcp-workflows/.github/workflows/Shared-GuidCheck.yml@workflows-prod
+    secrets:
+      AccessToken: ${{ secrets.GITHUB_TOKEN }}
