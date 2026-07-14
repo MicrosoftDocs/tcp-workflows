@@ -9,8 +9,11 @@ name: GUID check
 #
 # This workflow runs on `pull_request_target` (via the caller) so fork PRs are never
 # gated behind a manual "Approve and run" click. For security, it never checks out fork
-# code: the base branch is checked out (trusted) for the repo-wide GUID inventory, and
-# the PR's changed .md files are downloaded as DATA via the GitHub API (never executed).
+# code: the base branch is checked out (trusted) for the repo-wide GUID inventory, and the
+# PR's changed .md files are pulled in as DATA via a single authenticated `git fetch` of
+# the PR head ref, then read with local `git show` (never executed). Using one fetch
+# instead of one REST call per changed file avoids GitHub secondary rate limits that could
+# stall large PRs.
 
 permissions:
   pull-requests: write
@@ -55,10 +58,12 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      # Download the PR's changed .md files as DATA via the API. Nothing from the fork is
-      # placed in the working tree or executed. Content is fetched at the immutable head
-      # SHA (no TOCTOU) and the disk path is validated to stay inside PR_FILES_DIR.
-      - name: Download PR changed .md files via API (data only)
+      # Build the manifest of the PR's changed .md files (path + add/modify/rename/remove
+      # status + previous name for renames). listFiles is paginated (100 per page), so this
+      # is at most ceil(files/100) API calls regardless of PR size — NOT one call per file.
+      # No file CONTENT is fetched here; content is materialized in the next step from a
+      # single git fetch. Files under /includes/ are ignored throughout.
+      - name: Build manifest of changed .md files
         uses: actions/github-script@v8
         with:
           github-token: ${{ secrets.AccessToken }}
@@ -67,8 +72,6 @@ jobs:
             const path = require('path');
 
             const pr = context.payload.pull_request;
-            const headSha = pr.head.sha;                 // immutable commit, not a branch
-            const headRepo = pr.head.repo;               // fork repo (may equal base)
             const outDir = process.env.PR_FILES_DIR;
             fs.mkdirSync(outDir, { recursive: true });
 
@@ -89,55 +92,66 @@ jobs:
                 status: f.status,
                 previous: f.previous_filename || null,
               });
-
-              if (f.status === 'removed') continue;
-
-              // Resolve destination and guard against path traversal (defense in depth).
-              const dest = path.resolve(outDir, f.filename);
-              const rel = path.relative(outDir, dest);
-              if (rel === '' || rel.startsWith('..') || path.isAbsolute(rel)) {
-                core.setFailed(`Refusing to write outside PR_FILES_DIR: ${f.filename}`);
-                throw new Error('path traversal');
-              }
-
-              // Fetch file content at the head SHA as DATA. Prefer the fork repo at the
-              // immutable SHA (reliable for cross-fork commits); fall back to the
-              // per-file contents_url from listFiles.
-              let buf = null;
-              try {
-                const res = await github.rest.repos.getContent({
-                  owner: headRepo.owner.login,
-                  repo: headRepo.name,
-                  path: f.filename,
-                  ref: headSha,
-                });
-                if (res.data && res.data.content) {
-                  buf = Buffer.from(res.data.content, res.data.encoding || 'base64');
-                }
-              } catch (e) {
-                core.info(`getContent failed for ${f.filename}: ${e.message}; trying contents_url`);
-              }
-              if (buf === null && f.contents_url) {
-                try {
-                  const res = await github.request(f.contents_url);
-                  if (res.data && res.data.content) {
-                    buf = Buffer.from(res.data.content, res.data.encoding || 'base64');
-                  }
-                } catch (e) {
-                  core.info(`contents_url fetch failed for ${f.filename}: ${e.message}`);
-                }
-              }
-              if (buf === null) {
-                core.warning(`Could not fetch content for ${f.filename}; skipping its content checks.`);
-                continue;
-              }
-
-              fs.mkdirSync(path.dirname(dest), { recursive: true });
-              fs.writeFileSync(dest, buf);
             }
 
             fs.writeFileSync(path.join(outDir, '_manifest.json'), JSON.stringify(manifest));
             core.info(`Manifest: ${manifest.length} markdown file(s).`);
+
+      # Materialize the PR's changed .md files into PR_FILES_DIR as DATA using ONE git
+      # fetch (not one REST call per file). Under pull_request_target, origin is the trusted
+      # BASE repo, which publishes refs/pull/<n>/head for same-repo AND fork PRs — so a
+      # single authenticated fetch retrieves the (possibly fork) head content without adding
+      # a fork remote or checking out fork code. The token is applied only for the fetch (via
+      # a temporary http.extraheader that is removed immediately after) so it is never
+      # persisted for the untrusted content reads. Each file is then extracted with a LOCAL
+      # `git show` (no network, no rate limit); nothing from the fork is executed.
+      - name: Fetch PR head content and populate PR_FILES_DIR (data only)
+        env:
+          AccessToken: ${{ secrets.AccessToken }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          LC_ALL=C
+          export LC_ALL
+
+          MANIFEST="$PR_FILES_DIR/_manifest.json"
+          mkdir -p "$PR_FILES_DIR"
+
+          # Single authenticated fetch of the immutable PR head ref. The auth header is
+          # removed on exit (trap) so the privileged token never lingers in .git/config
+          # while the untrusted PR content is read below.
+          AUTH=$(printf 'x-access-token:%s' "$AccessToken" | base64 -w0)
+          cleanup() { git config --local --unset-all http.extraheader 2>/dev/null || true; }
+          trap cleanup EXIT
+          git config --local http.extraheader "AUTHORIZATION: basic $AUTH"
+          git fetch --no-tags --depth=1 origin "refs/pull/$PR_NUMBER/head"
+          cleanup
+          trap - EXIT
+
+          HEAD_SHA=$(git rev-parse FETCH_HEAD)
+          echo "Fetched PR head $HEAD_SHA"
+
+          # Write each added/modified/renamed .md at the PR head to PR_FILES_DIR via a local
+          # `git show` (removed files carry no content). The manifest paths come from the
+          # trusted listFiles API and are repo-relative; the `..` guard is defense in depth.
+          count=0
+          while IFS= read -r file; do
+            [ -n "$file" ] || continue
+            case "$file" in
+              */includes/*) continue ;;
+              *..*) echo "Refusing suspicious path: $file"; continue ;;
+            esac
+            dest="$PR_FILES_DIR/$file"
+            mkdir -p "$(dirname "$dest")"
+            if git show "$HEAD_SHA:$file" > "$dest" 2>/dev/null; then
+              count=$((count + 1))
+            else
+              rm -f "$dest"
+              echo "::warning::Could not read $file at PR head; skipping its content checks."
+            fi
+          done < <(jq -r '.[] | select(.status=="added" or .status=="modified" or .status=="renamed") | .path' "$MANIFEST")
+
+          echo "Populated PR_FILES_DIR with $count markdown file(s) from the PR head."
 
       - name: Extract GUIDs from PR files
         id: extract
@@ -425,7 +439,7 @@ jobs:
             src="$PR_FILES_DIR/$new_path"
             [ -f "$src" ] || continue
 
-            # Current GUID from the PR (head) content fetched via API.
+            # Current GUID from the PR (head) content fetched via git into PR_FILES_DIR.
             CURRENT_GUID=$(sed '1s/^\xEF\xBB\xBF//' "$src" | tr -d '\r' | sed -n '2,/^---$/p' | grep -i '^awa-articleGuid:' | sed 's/^[^:]*:\s*//' | tr -d '[:space:]')
 
             # Base branch GUID from the OLD path (handles renames correctly).
