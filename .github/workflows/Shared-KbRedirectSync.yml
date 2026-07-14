@@ -63,7 +63,7 @@ jobs:
 
       - name: Check out calling repo (live)
         id: checkout-caller
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           ref: ${{ fromJson(inputs.PayloadJson).sha }}
           path: caller
@@ -74,7 +74,7 @@ jobs:
           sparse-checkout-cone-mode: false
 
       - name: Clone siteroot repo
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           repository: ${{ inputs.SiterootRepo }}
           ref: ${{ inputs.SiterootBranch }}

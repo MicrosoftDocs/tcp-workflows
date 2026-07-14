@@ -8,12 +8,15 @@ name: GUID check
 # calling repo's branch protection / ruleset so a failure blocks the merge.
 #
 # This workflow runs on `pull_request_target` (via the caller) so fork PRs are never
-# gated behind a manual "Approve and run" click. For security, it never checks out fork
-# code: the base branch is checked out (trusted) for the repo-wide GUID inventory, and the
-# PR's changed .md files are pulled in as DATA via a single authenticated `git fetch` of
-# the PR head ref, then read with local `git show` (never executed). Using one fetch
-# instead of one REST call per changed file avoids GitHub secondary rate limits that could
-# stall large PRs.
+# gated behind a manual "Approve and run" click. It runs with the base repo's token and
+# secrets, so the PR's (possibly fork) code is treated strictly as DATA and is NEVER
+# executed — only YAML frontmatter is read; no build, install, or script from the PR is
+# ever run. The trusted base branch is checked out for the repo-wide GUID inventory, and
+# the PR head is checked out separately into `pr-head/` (sparse to *.md) using
+# actions/checkout's `allow-unsafe-pr-checkout` opt-in. Reading the changed files from that
+# one checkout — instead of one REST call per changed file — avoids the GitHub secondary
+# rate limits that could stall large PRs.
+# See https://docs.github.com/actions/reference/security/securely-using-pull_request_target
 
 permissions:
   pull-requests: write
@@ -38,10 +41,11 @@ jobs:
       # fork to deduplicate). Exposed as env so the bash checks can branch on it.
       IS_FORK: ${{ github.event.pull_request.head.repo.full_name != github.repository }}
     steps:
-      # PR_FILES_DIR holds untrusted PR file content as data only (never executed).
-      # Set here (not at job-level env) because the runner context isn't available there.
+      # PR_FILES_DIR is the working tree of the PR-head checkout below; it holds untrusted
+      # PR file content as data only (never executed). Set here (not at job-level env)
+      # because the runner context ($GITHUB_WORKSPACE) isn't available there.
       - name: Set up workspace paths
-        run: echo "PR_FILES_DIR=$RUNNER_TEMP/pr-files" >> "$GITHUB_ENV"
+        run: echo "PR_FILES_DIR=$GITHUB_WORKSPACE/pr-head" >> "$GITHUB_ENV"
 
       # Trusted base checkout for the repo-wide duplicate inventory and base-side GUID
       # reads. ref is pinned to the PR's BASE branch (github.base_ref) so the working-tree
@@ -52,17 +56,34 @@ jobs:
       # so checking it out is safe. persist-credentials: false keeps the privileged token
       # out of .git/config; all analysis below is local git reads that need no credentials.
       - name: Checkout base (trusted)
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           ref: ${{ github.base_ref }}
           fetch-depth: 0
           persist-credentials: false
 
+      # Check out the PR head as DATA into pr-head/. This is untrusted (possibly fork) code,
+      # so actions/checkout requires the `allow-unsafe-pr-checkout` opt-in under
+      # pull_request_target; it is safe here ONLY because the content is read as data and
+      # never executed. Sparse to *.md keeps the tree to markdown (no scripts or assets
+      # materialized) and, with checkout's automatic blob:none partial clone, minimizes the
+      # fetch. persist-credentials: false drops the token after checkout so the data-reading
+      # steps below cannot use it.
+      - name: Check out PR head (untrusted, data only)
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: pr-head
+          sparse-checkout: '**/*.md'
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+          allow-unsafe-pr-checkout: true
+
       # Build the manifest of the PR's changed .md files (path + add/modify/rename/remove
       # status + previous name for renames). listFiles is paginated (100 per page), so this
       # is at most ceil(files/100) API calls regardless of PR size — NOT one call per file.
-      # No file CONTENT is fetched here; content is materialized in the next step from a
-      # single git fetch. Files under /includes/ are ignored throughout.
+      # No file CONTENT is fetched here; the content comes from the PR-head checkout above.
+      # Files under /includes/ are ignored throughout.
       - name: Build manifest of changed .md files
         uses: actions/github-script@v8
         with:
@@ -96,62 +117,6 @@ jobs:
 
             fs.writeFileSync(path.join(outDir, '_manifest.json'), JSON.stringify(manifest));
             core.info(`Manifest: ${manifest.length} markdown file(s).`);
-
-      # Materialize the PR's changed .md files into PR_FILES_DIR as DATA using ONE git
-      # fetch (not one REST call per file). Under pull_request_target, origin is the trusted
-      # BASE repo, which publishes refs/pull/<n>/head for same-repo AND fork PRs — so a
-      # single authenticated fetch retrieves the (possibly fork) head content without adding
-      # a fork remote or checking out fork code. The token is applied only for the fetch (via
-      # a temporary http.extraheader that is removed immediately after) so it is never
-      # persisted for the untrusted content reads. Each file is then extracted with a LOCAL
-      # `git show` (no network, no rate limit); nothing from the fork is executed.
-      - name: Fetch PR head content and populate PR_FILES_DIR (data only)
-        env:
-          AccessToken: ${{ secrets.AccessToken }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-        run: |
-          set -euo pipefail
-          LC_ALL=C
-          export LC_ALL
-
-          MANIFEST="$PR_FILES_DIR/_manifest.json"
-          mkdir -p "$PR_FILES_DIR"
-
-          # Single authenticated fetch of the immutable PR head ref. The auth header is
-          # removed on exit (trap) so the privileged token never lingers in .git/config
-          # while the untrusted PR content is read below.
-          AUTH=$(printf 'x-access-token:%s' "$AccessToken" | base64 -w0)
-          cleanup() { git config --local --unset-all http.extraheader 2>/dev/null || true; }
-          trap cleanup EXIT
-          git config --local http.extraheader "AUTHORIZATION: basic $AUTH"
-          git fetch --no-tags --depth=1 origin "refs/pull/$PR_NUMBER/head"
-          cleanup
-          trap - EXIT
-
-          HEAD_SHA=$(git rev-parse FETCH_HEAD)
-          echo "Fetched PR head $HEAD_SHA"
-
-          # Write each added/modified/renamed .md at the PR head to PR_FILES_DIR via a local
-          # `git show` (removed files carry no content). The manifest paths come from the
-          # trusted listFiles API and are repo-relative; the `..` guard is defense in depth.
-          count=0
-          while IFS= read -r file; do
-            [ -n "$file" ] || continue
-            case "$file" in
-              */includes/*) continue ;;
-              *..*) echo "Refusing suspicious path: $file"; continue ;;
-            esac
-            dest="$PR_FILES_DIR/$file"
-            mkdir -p "$(dirname "$dest")"
-            if git show "$HEAD_SHA:$file" > "$dest" 2>/dev/null; then
-              count=$((count + 1))
-            else
-              rm -f "$dest"
-              echo "::warning::Could not read $file at PR head; skipping its content checks."
-            fi
-          done < <(jq -r '.[] | select(.status=="added" or .status=="modified" or .status=="renamed") | .path' "$MANIFEST")
-
-          echo "Populated PR_FILES_DIR with $count markdown file(s) from the PR head."
 
       - name: Extract GUIDs from PR files
         id: extract
@@ -307,7 +272,10 @@ jobs:
           # consumers derive from it: (a) duplicate detection in this step, and (b) the
           # base-was-duplicate counts used by the changed-GUID step. GUID values are emitted
           # lowercased so both consumers can compare case-insensitively.
-          find . -name '*.md' -not -path '*/includes/*' -print0 | \
+          # NOTE: this scan runs in the base checkout at the workspace root, so it must
+          # exclude ./pr-head (the untrusted PR-head checkout) — otherwise the PR's own
+          # files would pollute the base inventory. Any future repo-wide scan must do the same.
+          find . -name '*.md' -not -path '*/includes/*' -not -path './pr-head/*' -print0 | \
             xargs -0 awk '
               FNR == 1 { fn = FILENAME; sub(/^\.\//, "", fn) }
               FNR > 50 { nextfile }
@@ -439,7 +407,7 @@ jobs:
             src="$PR_FILES_DIR/$new_path"
             [ -f "$src" ] || continue
 
-            # Current GUID from the PR (head) content fetched via git into PR_FILES_DIR.
+            # Current GUID from the PR (head) content in the PR-head checkout (PR_FILES_DIR).
             CURRENT_GUID=$(sed '1s/^\xEF\xBB\xBF//' "$src" | tr -d '\r' | sed -n '2,/^---$/p' | grep -i '^awa-articleGuid:' | sed 's/^[^:]*:\s*//' | tr -d '[:space:]')
 
             # Base branch GUID from the OLD path (handles renames correctly).
