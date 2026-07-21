@@ -39,12 +39,10 @@ jobs:
       if: github.repository_owner == 'MicrosoftDocs' && contains(github.event.repository.topics, 'build')
       runs-on: ubuntu-latest
       steps:
-        - name: Check out repo
-          id: checkout-repo
-          uses: actions/checkout@v5
-          with:
-            ref: ${{ fromJson(inputs.PayloadJson).event.pull_request.head.sha }}
-        
+        # No source checkout: this job reads everything it needs over the GitHub REST
+        # API (PR file list, article contents, and docfx.json — see Get-DocFxConfig).
+        # Avoiding a checkout of the untrusted PR head keeps fork-controlled content out
+        # of this privileged workflow_run context entirely.
         - name: Create App Token
           id: app-token
           uses: actions/create-github-app-token@v3
@@ -57,17 +55,12 @@ jobs:
           shell: pwsh
           env: 
             GlobalExcludedReviewerList:  '[
-                    "dstrome",
-                    "sc-dstrome",
+                    "vinaypamnani-msft",
+                    "sc-vinpa",
                     "garycentric",
                     "garymoore-sc",
-                    "serdarsoysal",
                     "cx-ktsuji",
-                    "dawntanner",
-                    "pamgreen-msft",
-                    "pebaum",
-                    "SerdarSoysal",
-                    "vinaypamnani-msft"
+                    "mestew"
                 ]'
 
             PayloadJson: ${{ inputs.PayloadJson }}
@@ -81,7 +74,7 @@ jobs:
 
           run: |
             # Get runspace info
-            $RepoRoot = $env:GITHUB_WORKSPACE
+            $DocFxConfigCache = @{}   # Cache of docfx.json configs keyed by directory, to avoid repeat API calls.
             $RepoName = $env:GITHUB_REPOSITORY
             $WorkflowName = $env:GITHUB_WORKFLOW -replace '[\\/:*?"<>|\s]', '_'
             $WorkflowRunId = $env:GITHUB_RUN_ID
@@ -259,76 +252,79 @@ jobs:
             # Get-DocFxConfig
             
             Function Get-DocFxConfig {
-    
+
                 [CmdletBinding()]
                 Param (
                     [Parameter(Mandatory = $true)]
                     [string]$FilePath
                 )
 
-                If (-not $RepoRoot) {
+                # Resolve the docfx.json that governs $FilePath by walking up the file's
+                # directory chain and querying the GitHub Contents API for the nearest
+                # ancestor docfx.json. Read from the PR's BASE branch ($TargetBranch) in the
+                # trusted base repo (MicrosoftDocs/$GitHubRepoName), never from the untrusted
+                # PR head. docfx.json is a stable docset-root config that content PRs don't
+                # modify, so the base-branch copy is the correct one to apply.
+                #
+                # Results (hits AND 404 misses) are cached per directory in $DocFxConfigCache
+                # so each docfx.json is fetched at most once per run regardless of how many
+                # changed files share a docset.
 
-                    Throw 'Repository root could not be determined.'
+                # Normalize to a forward-slash, repo-relative path and derive its directory.
+                $NormPath = ($FilePath -replace '\\', '/').TrimStart('/')
+                $Dir = If ($NormPath.Contains('/')) { $NormPath.Substring(0, $NormPath.LastIndexOf('/')) } Else { '' }
 
-                }
+                While ($True) {
 
-                Try {
+                    If ($DocFxConfigCache.ContainsKey($Dir)) {
 
-                    $FullPath = (Resolve-Path -LiteralPath $FilePath -ErrorAction Stop).Path
-                    $RepoRoot = (Resolve-Path -LiteralPath $RepoRoot -ErrorAction Stop).Path.TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+                        # Cached hit returns immediately; a cached $null (miss) falls through to walk up.
+                        If ($null -ne $DocFxConfigCache[$Dir]) {
 
-                    $FileResolved = $True
-
-                } Catch {
-                 
-                    Write-Host "Unable to resolve $FilePath. File may have been deleted."
-                    $FileResolved = $False
-
-                }
-
-                If ($FileResolved) {
-
-                    # Confirm the file is inside the repo
-                    If (-not $FullPath.StartsWith($RepoRoot, [StringComparison]::OrdinalIgnoreCase)) {
-
-                        Throw 'FilePath is not located underneath the repository root.'
-
-                    }
-
-                    # Walk up the tree 
-                    $CurrentDir = Split-Path -Path $FullPath -Parent
-
-                    While ($CurrentDir) {
-
-                        $Candidate = Join-Path -Path $CurrentDir -ChildPath 'docfx.json'
-
-                        If (Test-Path -LiteralPath $Candidate -PathType Leaf) {
-                            
-                            Write-Host "Getting DocFx config from $Candidate"
-
-                            Return (Get-Content -LiteralPath $Candidate -Raw) | ConvertFrom-Json -AsHashtable
-                        }
-
-                        If ($CurrentDir.TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar) -eq $RepoRoot) {
-
-                            Break
+                            Return $DocFxConfigCache[$Dir]
 
                         }
 
-                        # Get the parent of the current folder
-                        $CurrentDir = Split-Path -Path $CurrentDir -Parent
+                    } Else {
+
+                        $ConfigPath = If ($Dir) { "$Dir/docfx.json" } Else { 'docfx.json' }
+                        $ConfigUrl = $GitHubApiUrl + $GitHubRepoName + "/contents/" + $ConfigPath + "?ref=$TargetBranch"
+
+                        Try {
+
+                            $Response = Invoke-RestMethod -Method GET -Uri $ConfigUrl -Headers $GitHubHeaders
+                            $DocFxJson = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($Response.content))
+                            $Config = $DocFxJson | ConvertFrom-Json -AsHashtable
+
+                            Write-Host "Getting DocFx config from $ConfigPath (ref $TargetBranch)"
+
+                            $DocFxConfigCache[$Dir] = $Config
+                            Return $Config
+
+                        } Catch {
+
+                            # A 404 (no docfx.json in this directory) is expected while walking up.
+                            # Cache the miss so sibling files don't re-query the same directory.
+                            $DocFxConfigCache[$Dir] = $null
+
+                        }
 
                     }
 
+                    # Reached the repo root ('') without finding a docfx.json.
+                    If (-not $Dir) {
+
+                        Break
+
+                    }
+
+                    # Move to the parent directory.
+                    $Dir = If ($Dir.Contains('/')) { $Dir.Substring(0, $Dir.LastIndexOf('/')) } Else { '' }
+
                 }
 
-                If ($FileResolved) {
-                
-                    Write-Host "ERROR: File path $FullPath and repo root $RepoRoot were resolved but no docfx.json file was found."
-                
-                }
+                Write-Host "No docfx.json found for $FilePath walking up to repo root on branch $TargetBranch."
 
-                # Only reached if $FilePath isn't resolved or if While loop falls through without finding docfx.json.
                 Return $null
             }
 
