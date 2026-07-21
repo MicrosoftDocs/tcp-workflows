@@ -63,7 +63,7 @@ jobs:
 
       - name: Check out calling repo (live)
         id: checkout-caller
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           ref: ${{ fromJson(inputs.PayloadJson).sha }}
           path: caller
@@ -74,13 +74,19 @@ jobs:
           sparse-checkout-cone-mode: false
 
       - name: Clone siteroot repo
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           repository: ${{ inputs.SiterootRepo }}
           ref: ${{ inputs.SiterootBranch }}
           token: ${{ steps.app-token.outputs.token }}
           path: siteroot
-          fetch-depth: 0
+          # Shallow (depth 1) on purpose: this job only needs the CURRENT siteroot state
+          # (read/rewrite the redirect JSON, then commit a new branch and push) — never
+          # history. The redirect JSON files are multi-MB and rewritten on nearly every
+          # sync, so full history grows without bound while a single commit stays small.
+          # Pushing a new branch built on the fetched HEAD works from a shallow clone
+          # because that boundary commit is the current remote HEAD.
+          fetch-depth: 1
 
       - name: Generate redirect JSON
         id: generate
