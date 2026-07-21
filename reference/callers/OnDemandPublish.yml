@@ -13,13 +13,15 @@ on:
 jobs:
 
   # Pre-filter: only run when the comment contains a "#trusted-" command token, so the ~99% of PR
-  # comments without a command never start a runner.
+  # comments without a command never start a runner. Skip the workflow's own responder bot: its replies
+  # embed the "#trusted-publish" token, which would otherwise re-trigger this job on every response.
   config:
     if: >-
       github.repository_owner == 'MicrosoftDocs'
       && contains(github.event.repository.topics, 'build')
       && github.event.issue.pull_request != null
       && contains(github.event.comment.body, '#trusted-')
+      && github.event.comment.user.login != 'm365-skilling-repo-management[bot]'
     runs-on: ubuntu-latest
     outputs:
       EnableAfterHoursPublish: ${{ steps.read.outputs.EnableAfterHoursPublish }}
@@ -28,10 +30,34 @@ jobs:
       ServicingAuthorizedTeam: ${{ steps.read.outputs.ServicingAuthorizedTeam }}
       ServicingAuthorizedApps: ${{ steps.read.outputs.ServicingAuthorizedApps }}
     steps:
+      # Acknowledge receipt first, before checkout, so the submitter gets an instant "eyes" reaction while the
+      # reusable workflow validates the command and authorization. Non-fatal - never block on this.
+      - name: Acknowledge comment
+        shell: pwsh
+        env:
+          CommentUrl: ${{ github.event.comment.url }}
+          GitHubToken: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $Headers = @{
+            Accept = 'application/vnd.github+json'
+            Authorization = "Bearer $Env:GitHubToken"
+            'X-GitHub-Api-Version' = '2022-11-28'
+          }
+
+          # Post the "eyes" reaction. Wrapped in try/catch so a reaction failure never blocks processing.
+          Try {
+            $ReactionBody = @{ content = 'eyes' } | ConvertTo-Json
+            Invoke-RestMethod -Uri "$Env:CommentUrl/reactions" -Headers $Headers -Body $ReactionBody -Method Post -ErrorAction Stop | Out-Null
+          } Catch {
+            Write-Warning "Failed to add the acknowledgment reaction. Processing will continue. Error: $($_.Exception.Message)"
+          }
+
       - uses: actions/checkout@v5
         with:
           sparse-checkout: .github/workflow-config.json
           sparse-checkout-cone-mode: false
+
+      # Read the repo's on-demand publishing configuration. Command detection and validation live in the shared workflow.
       - id: read
         shell: pwsh
         run: |
@@ -42,13 +68,10 @@ jobs:
           "ServicingAuthorizedTeam=$($Config.ServicingAuthorizedTeam)" >> $Env:GITHUB_OUTPUT
           "ServicingAuthorizedApps=$(($Config.ServicingAuthorizedApps -join ','))" >> $Env:GITHUB_OUTPUT
 
-  # Same "#trusted-" prefix gate as above.
+  # The shared workflow detects, validates, and responds to the command; this job forwards the event to it.
+  # No `if:` needed - `needs: config` means this job is skipped automatically whenever the config job's gate
+  # doesn't pass, so the entry conditions live in exactly one place.
   on-demand-publish:
-    if: >-
-      github.repository_owner == 'MicrosoftDocs'
-      && contains(github.event.repository.topics, 'build')
-      && github.event.issue.pull_request != null
-      && contains(github.event.comment.body, '#trusted-')
     needs: config
     uses: MicrosoftDocs/tcp-workflows/.github/workflows/Shared-OnDemandPublish.yml@workflows-prod
     with:
