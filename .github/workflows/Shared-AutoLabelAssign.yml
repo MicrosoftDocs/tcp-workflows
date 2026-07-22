@@ -270,56 +270,60 @@ jobs:
                 # so each docfx.json is fetched at most once per run regardless of how many
                 # changed files share a docset.
 
-                # Normalize to a forward-slash, repo-relative path and derive its directory.
-                $NormPath = ($FilePath -replace '\\', '/').TrimStart('/')
-                $Dir = If ($NormPath.Contains('/')) { $NormPath.Substring(0, $NormPath.LastIndexOf('/')) } Else { '' }
+                # Normalize to a forward-slash, repo-relative path and split its directory
+                # portion into segments (the file name is dropped). docfx.json lives at one of
+                # these ancestor directories or at the repo root. $DirParts is initialized and
+                # assigned as statements (not via an If-expression): a bare `@()` or a
+                # single-element array returned from an If-block is enumerated on the way out,
+                # collapsing to $null or a scalar string and breaking the Join/index below.
+                $NormPath = ($FilePath -replace '\\', '/').Trim('/')
+                $LastSlash = $NormPath.LastIndexOf('/')
+                $DirPath = If ($LastSlash -ge 0) { $NormPath.Substring(0, $LastSlash) } Else { '' }
+                [string[]]$DirParts = @()
+                If ($DirPath) { $DirParts = $DirPath.Split('/') }
 
-                While ($True) {
+                # Bounded walk from the file's own directory up to the repo root (''): exactly
+                # ($DirParts.Count + 1) iterations via a finite descending range. Depth is the
+                # number of leading segments to keep, so Depth 0 is the repo root. Return the
+                # first docfx.json found.
+                ForEach ($Depth in $DirParts.Count..0) {
+
+                    $Dir = [string]::Join('/', $DirParts, 0, $Depth)
 
                     If ($DocFxConfigCache.ContainsKey($Dir)) {
 
-                        # Cached hit returns immediately; a cached $null (miss) falls through to walk up.
+                        # Cached hit returns immediately; a cached $null (miss) keeps walking up.
                         If ($null -ne $DocFxConfigCache[$Dir]) {
 
                             Return $DocFxConfigCache[$Dir]
 
                         }
 
-                    } Else {
-
-                        $ConfigPath = If ($Dir) { "$Dir/docfx.json" } Else { 'docfx.json' }
-                        $ConfigUrl = $GitHubApiUrl + $GitHubRepoName + "/contents/" + $ConfigPath + "?ref=$TargetBranch"
-
-                        Try {
-
-                            $Response = Invoke-RestMethod -Method GET -Uri $ConfigUrl -Headers $GitHubHeaders
-                            $DocFxJson = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($Response.content))
-                            $Config = $DocFxJson | ConvertFrom-Json -AsHashtable
-
-                            Write-Host "Getting DocFx config from $ConfigPath (ref $TargetBranch)"
-
-                            $DocFxConfigCache[$Dir] = $Config
-                            Return $Config
-
-                        } Catch {
-
-                            # A 404 (no docfx.json in this directory) is expected while walking up.
-                            # Cache the miss so sibling files don't re-query the same directory.
-                            $DocFxConfigCache[$Dir] = $null
-
-                        }
+                        Continue
 
                     }
 
-                    # Reached the repo root ('') without finding a docfx.json.
-                    If (-not $Dir) {
+                    $ConfigPath = If ($Dir) { "$Dir/docfx.json" } Else { 'docfx.json' }
+                    $ConfigUrl = $GitHubApiUrl + $GitHubRepoName + "/contents/" + $ConfigPath + "?ref=$TargetBranch"
 
-                        Break
+                    Try {
+
+                        $Response = Invoke-RestMethod -Method GET -Uri $ConfigUrl -Headers $GitHubHeaders
+                        $DocFxJson = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($Response.content))
+                        $Config = $DocFxJson | ConvertFrom-Json -AsHashtable
+
+                        Write-Host "Getting DocFx config from $ConfigPath (ref $TargetBranch)"
+
+                        $DocFxConfigCache[$Dir] = $Config
+                        Return $Config
+
+                    } Catch {
+
+                        # A 404 (no docfx.json in this directory) is expected while walking up.
+                        # Cache the miss so sibling files don't re-query the same directory.
+                        $DocFxConfigCache[$Dir] = $null
 
                     }
-
-                    # Move to the parent directory.
-                    $Dir = If ($Dir.Contains('/')) { $Dir.Substring(0, $Dir.LastIndexOf('/')) } Else { '' }
 
                 }
 
