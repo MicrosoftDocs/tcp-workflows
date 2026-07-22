@@ -1371,6 +1371,31 @@ jobs:
 
             If ((($GitRequestEvent -eq "pull_request") -or ($GitRequestEvent -eq "pull_request_target")) -and (($GitHubAction -eq "opened") -or ($GitHubAction -eq "ready_for_review") -or ($GitHubAction -eq "reopened") -or ($GitHubAction -eq "synchronize"))) {
 
+                # Content Studio direct edits target CIP draft branches (cip/draft/<repo>/issue-<n>/<guid>/...).
+                # Tag them with a marker label for identification/tracking. Placed here (not under the
+                # $AutoLabel toggle or the file-metadata checks) so every Content Studio PR is labeled.
+                If ($TargetBranch -like 'cip/draft/*') {
+
+                    $ContentStudioLabel = "ContentStudio-DirectEdit"
+                    $ContentStudioLabelColor = "6F42C1"
+
+                    If (!(Test-RepoLabel -RepoUri $RepoLabelUrl -Name $ContentStudioLabel)) {
+
+                        New-RepoLabel -RepoUri $RepoLabelUrl -Name $ContentStudioLabel -Color $ContentStudioLabelColor -Description "Direct edit created via Content Studio (targets a cip/draft branch)."
+
+                    }
+
+                    $ContentStudioLabelResult = Test-Prlabel -LabelArray $ContentStudioLabel -IssueUrl $IssueUrl
+
+                    If (!$ContentStudioLabelResult.$ContentStudioLabel) {
+
+                        Write-Host "Adding $ContentStudioLabel label to PR targeting CIP draft branch $TargetBranch."
+                        Set-PrLabel -IssueUrl $IssueUrl -LabelName $ContentStudioLabel
+
+                    }
+
+                }
+
                 Try {
 
                     Write-Host "Getting file list for PR $PrFileListUrl."
@@ -1453,8 +1478,9 @@ jobs:
                             If (($AutoAssignReviewers -eq $True) -and ($PrCreator -notlike "*\[bot\]*")) {
                             
                                 # There's a short window between PR open and when Draft is set by the TierManagement workflow where PR reviewers could be added.
-                                # This If statement prevents that from happening.
-                                If (($GitHubAction -ne "opened") -and ($IsPrDraft -eq $False)) {
+                                # This If statement prevents that from happening. Also suppress reviewers for Content Studio PRs targeting CIP
+                                # draft branches (cip/draft/*) - reviewers only make sense on publish-bound branches. All other branches unchanged.
+                                If (($GitHubAction -ne "opened") -and ($IsPrDraft -eq $False) -and ($TargetBranch -notlike 'cip/draft/*')) {
 
                                     # Get permission level of user who created the comment. Need to use .role_name instead of .permission because .permission provides only legacy values. 
                                     # .role_name provides legacy plus triage, maintain, and custom roles like write-elevated.
