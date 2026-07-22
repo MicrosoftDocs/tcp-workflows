@@ -1,0 +1,15 @@
+name: KB IDs in PR are valid and unique
+
+permissions:
+  pull-requests: write
+  contents: read
+
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize]
+
+jobs:
+  kbid-check:
+    uses: MicrosoftDocs/tcp-workflows/.github/workflows/Shared-KbIdCheck.yml@workflows-prod
+    secrets:
+      AccessToken: ${{ secrets.GITHUB_TOKEN }}
