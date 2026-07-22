@@ -270,56 +270,60 @@ jobs:
                 # so each docfx.json is fetched at most once per run regardless of how many
                 # changed files share a docset.
 
-                # Normalize to a forward-slash, repo-relative path and derive its directory.
-                $NormPath = ($FilePath -replace '\\', '/').TrimStart('/')
-                $Dir = If ($NormPath.Contains('/')) { $NormPath.Substring(0, $NormPath.LastIndexOf('/')) } Else { '' }
+                # Normalize to a forward-slash, repo-relative path and split its directory
+                # portion into segments (the file name is dropped). docfx.json lives at one of
+                # these ancestor directories or at the repo root. $DirParts is initialized and
+                # assigned as statements (not via an If-expression): a bare `@()` or a
+                # single-element array returned from an If-block is enumerated on the way out,
+                # collapsing to $null or a scalar string and breaking the Join/index below.
+                $NormPath = ($FilePath -replace '\\', '/').Trim('/')
+                $LastSlash = $NormPath.LastIndexOf('/')
+                $DirPath = If ($LastSlash -ge 0) { $NormPath.Substring(0, $LastSlash) } Else { '' }
+                [string[]]$DirParts = @()
+                If ($DirPath) { $DirParts = $DirPath.Split('/') }
 
-                While ($True) {
+                # Bounded walk from the file's own directory up to the repo root (''): exactly
+                # ($DirParts.Count + 1) iterations via a finite descending range. Depth is the
+                # number of leading segments to keep, so Depth 0 is the repo root. Return the
+                # first docfx.json found.
+                ForEach ($Depth in $DirParts.Count..0) {
+
+                    $Dir = [string]::Join('/', $DirParts, 0, $Depth)
 
                     If ($DocFxConfigCache.ContainsKey($Dir)) {
 
-                        # Cached hit returns immediately; a cached $null (miss) falls through to walk up.
+                        # Cached hit returns immediately; a cached $null (miss) keeps walking up.
                         If ($null -ne $DocFxConfigCache[$Dir]) {
 
                             Return $DocFxConfigCache[$Dir]
 
                         }
 
-                    } Else {
-
-                        $ConfigPath = If ($Dir) { "$Dir/docfx.json" } Else { 'docfx.json' }
-                        $ConfigUrl = $GitHubApiUrl + $GitHubRepoName + "/contents/" + $ConfigPath + "?ref=$TargetBranch"
-
-                        Try {
-
-                            $Response = Invoke-RestMethod -Method GET -Uri $ConfigUrl -Headers $GitHubHeaders
-                            $DocFxJson = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($Response.content))
-                            $Config = $DocFxJson | ConvertFrom-Json -AsHashtable
-
-                            Write-Host "Getting DocFx config from $ConfigPath (ref $TargetBranch)"
-
-                            $DocFxConfigCache[$Dir] = $Config
-                            Return $Config
-
-                        } Catch {
-
-                            # A 404 (no docfx.json in this directory) is expected while walking up.
-                            # Cache the miss so sibling files don't re-query the same directory.
-                            $DocFxConfigCache[$Dir] = $null
-
-                        }
+                        Continue
 
                     }
 
-                    # Reached the repo root ('') without finding a docfx.json.
-                    If (-not $Dir) {
+                    $ConfigPath = If ($Dir) { "$Dir/docfx.json" } Else { 'docfx.json' }
+                    $ConfigUrl = $GitHubApiUrl + $GitHubRepoName + "/contents/" + $ConfigPath + "?ref=$TargetBranch"
 
-                        Break
+                    Try {
+
+                        $Response = Invoke-RestMethod -Method GET -Uri $ConfigUrl -Headers $GitHubHeaders
+                        $DocFxJson = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($Response.content))
+                        $Config = $DocFxJson | ConvertFrom-Json -AsHashtable
+
+                        Write-Host "Getting DocFx config from $ConfigPath (ref $TargetBranch)"
+
+                        $DocFxConfigCache[$Dir] = $Config
+                        Return $Config
+
+                    } Catch {
+
+                        # A 404 (no docfx.json in this directory) is expected while walking up.
+                        # Cache the miss so sibling files don't re-query the same directory.
+                        $DocFxConfigCache[$Dir] = $null
 
                     }
-
-                    # Move to the parent directory.
-                    $Dir = If ($Dir.Contains('/')) { $Dir.Substring(0, $Dir.LastIndexOf('/')) } Else { '' }
 
                 }
 
@@ -1371,6 +1375,31 @@ jobs:
 
             If ((($GitRequestEvent -eq "pull_request") -or ($GitRequestEvent -eq "pull_request_target")) -and (($GitHubAction -eq "opened") -or ($GitHubAction -eq "ready_for_review") -or ($GitHubAction -eq "reopened") -or ($GitHubAction -eq "synchronize"))) {
 
+                # Content Studio direct edits target CIP draft branches (cip/draft/<repo>/issue-<n>/<guid>/...).
+                # Tag them with a marker label for identification/tracking. Placed here (not under the
+                # $AutoLabel toggle or the file-metadata checks) so every Content Studio PR is labeled.
+                If ($TargetBranch -like 'cip/draft/*') {
+
+                    $ContentStudioLabel = "ContentStudio-DirectEdit"
+                    $ContentStudioLabelColor = "6F42C1"
+
+                    If (!(Test-RepoLabel -RepoUri $RepoLabelUrl -Name $ContentStudioLabel)) {
+
+                        New-RepoLabel -RepoUri $RepoLabelUrl -Name $ContentStudioLabel -Color $ContentStudioLabelColor -Description "Direct edit created via Content Studio (targets a cip/draft branch)."
+
+                    }
+
+                    $ContentStudioLabelResult = Test-Prlabel -LabelArray $ContentStudioLabel -IssueUrl $IssueUrl
+
+                    If (!$ContentStudioLabelResult.$ContentStudioLabel) {
+
+                        Write-Host "Adding $ContentStudioLabel label to PR targeting CIP draft branch $TargetBranch."
+                        Set-PrLabel -IssueUrl $IssueUrl -LabelName $ContentStudioLabel
+
+                    }
+
+                }
+
                 Try {
 
                     Write-Host "Getting file list for PR $PrFileListUrl."
@@ -1453,8 +1482,9 @@ jobs:
                             If (($AutoAssignReviewers -eq $True) -and ($PrCreator -notlike "*\[bot\]*")) {
                             
                                 # There's a short window between PR open and when Draft is set by the TierManagement workflow where PR reviewers could be added.
-                                # This If statement prevents that from happening.
-                                If (($GitHubAction -ne "opened") -and ($IsPrDraft -eq $False)) {
+                                # This If statement prevents that from happening. Also suppress reviewers for Content Studio PRs targeting CIP
+                                # draft branches (cip/draft/*) - reviewers only make sense on publish-bound branches. All other branches unchanged.
+                                If (($GitHubAction -ne "opened") -and ($IsPrDraft -eq $False) -and ($TargetBranch -notlike 'cip/draft/*')) {
 
                                     # Get permission level of user who created the comment. Need to use .role_name instead of .permission because .permission provides only legacy values. 
                                     # .role_name provides legacy plus triage, maintain, and custom roles like write-elevated.

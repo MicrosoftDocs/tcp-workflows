@@ -449,7 +449,9 @@ jobs:
 
     set-draft:
       name: Set PR as draft
-      if: github.repository_owner == 'MicrosoftDocs' && github.event_name == 'pull_request_target' && !contains(github.event.pull_request.user.login, '[bot]')
+      # Skip Content Studio PRs that target a CIP draft branch (cip/draft/<repo>/issue-<n>/<guid>/...).
+      # These are not headed for a publish branch, so drafting them breaks the CIP flow.
+      if: github.repository_owner == 'MicrosoftDocs' && github.event_name == 'pull_request_target' && !contains(github.event.pull_request.user.login, '[bot]') && !startsWith(github.event.pull_request.base.ref, 'cip/draft/')
       runs-on: ubuntu-latest
       steps:
         - name: Script
