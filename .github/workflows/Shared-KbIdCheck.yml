@@ -1,0 +1,727 @@
+name: KB ID check
+
+# Gates pull requests for awa-kb_id issues in the markdown files a PR touches:
+#   - a mistyped field-name key (a near-miss of awa-kb_id that the KB redirect pipeline
+#     would silently ignore, e.g. awa-kbid / awa_kb_id / awa-kb-id)
+#   - an invalid value (awa-kb_id must be an unsigned integer)
+#   - the common copy/paste error of leaving the "KB" prefix on the value (e.g. KB2925701)
+#   - a value duplicated somewhere else in the repo
+#   - a changed / removed kb_id on an existing article
+# Each problem fails the job and comments on the PR. Mark this check as REQUIRED in the
+# calling repo's branch protection / ruleset so a failure blocks the merge.
+#
+# Only validates/dedupes kb_ids that are PRESENT and new-or-changed; a file with no kb_id
+# is skipped (KB IDs come from the real KB article and cannot be generated). The only fixes
+# offered are the KB-prefix-stripped value and the corrected field-name key.
+#
+# This workflow runs on `pull_request_target` (via the caller) so fork PRs are never gated
+# behind a manual "Approve and run" click. It runs with the base repo's token and secrets,
+# so the PR's (possibly fork) code is treated strictly as DATA and is NEVER executed — only
+# YAML frontmatter is read; no build, install, or script from the PR is ever run. The
+# trusted base branch is checked out for the repo-wide kb_id inventory, and the PR head is
+# checked out separately into `pr-head/` (sparse to *.md) using actions/checkout's
+# `allow-unsafe-pr-checkout` opt-in. Reading the changed files from that one checkout —
+# instead of one REST call per changed file — avoids the GitHub secondary rate limits that
+# could stall large PRs.
+# See https://docs.github.com/actions/reference/security/securely-using-pull_request_target
+
+permissions:
+  pull-requests: write
+  contents: read
+
+on:
+  workflow_call:
+    secrets:
+      AccessToken:
+        required: true
+
+jobs:
+  check-kbids:
+    if: github.repository_owner == 'MicrosoftDocs'
+    runs-on: ubuntu-latest
+    env:
+      # Passed via env (not inlined into run scripts) to avoid expression injection.
+      BASE_REF: ${{ github.base_ref }}
+      # True when the PR's head repo differs from the base repo (a fork PR). Used to decide
+      # whether an inline one-click "Commit suggestion" is offered (only fork contributors
+      # own their branch and can apply it). Exposed as env so the JS check can branch on it.
+      IS_FORK: ${{ github.event.pull_request.head.repo.full_name != github.repository }}
+    steps:
+      # PR_FILES_DIR is the working tree of the PR-head checkout below; it holds untrusted
+      # PR file content as data only (never executed). Set here (not at job-level env)
+      # because the runner context ($GITHUB_WORKSPACE) isn't available there.
+      - name: Set up workspace paths
+        run: echo "PR_FILES_DIR=$GITHUB_WORKSPACE/pr-head" >> "$GITHUB_ENV"
+
+      # Trusted base checkout for the repo-wide duplicate inventory and base-side kb_id
+      # reads. ref is pinned to the PR's BASE branch (github.base_ref) so the working-tree
+      # inventory reflects the branch this PR actually targets — not the repo default
+      # branch. base_ref is the upstream target branch, never fork-controlled, so checking
+      # it out is safe. persist-credentials: false keeps the privileged token out of
+      # .git/config; all analysis below is local git reads that need no credentials.
+      - name: Checkout base (trusted)
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.base_ref }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      # Check out the PR head as DATA into pr-head/. This is untrusted (possibly fork) code,
+      # so actions/checkout requires the `allow-unsafe-pr-checkout` opt-in under
+      # pull_request_target; it is safe here ONLY because the content is read as data and
+      # never executed. Sparse to *.md keeps the tree to markdown (no scripts or assets
+      # materialized). persist-credentials: false drops the token after checkout so the
+      # data-reading steps below cannot use it.
+      - name: Check out PR head (untrusted, data only)
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: pr-head
+          sparse-checkout: '**/*.md'
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+          allow-unsafe-pr-checkout: true
+
+      # Build the manifest of the PR's changed .md files (path + add/modify/rename/remove
+      # status + previous name for renames). listFiles is paginated (100 per page), so this
+      # is at most ceil(files/100) API calls regardless of PR size — NOT one call per file.
+      # No file CONTENT is fetched here; the content comes from the PR-head checkout above.
+      # Files under /includes/ are ignored throughout.
+      - name: Build manifest of changed .md files
+        uses: actions/github-script@v8
+        with:
+          github-token: ${{ secrets.AccessToken }}
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+
+            const pr = context.payload.pull_request;
+            const outDir = process.env.PR_FILES_DIR;
+            fs.mkdirSync(outDir, { recursive: true });
+
+            const files = await github.paginate(github.rest.pulls.listFiles, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: pr.number,
+              per_page: 100,
+            });
+
+            const manifest = [];
+            for (const f of files) {
+              if (!f.filename.endsWith('.md')) continue;
+              if (f.filename.includes('/includes/')) continue;
+
+              manifest.push({
+                path: f.filename,
+                status: f.status,
+                previous: f.previous_filename || null,
+              });
+            }
+
+            fs.writeFileSync(path.join(outDir, '_manifest.json'), JSON.stringify(manifest));
+            core.info(`Manifest: ${manifest.length} markdown file(s).`);
+
+      - name: Extract kb_ids from PR files
+        id: extract
+        run: |
+          LC_ALL=C
+          export LC_ALL
+
+          MANIFEST="$PR_FILES_DIR/_manifest.json"
+
+          # Candidate files that may carry a kb_id: added/modified/renamed.
+          # Output: status<TAB>new_path<TAB>old_path (old_path = previous name for renames).
+          jq -r '.[] | select(.status=="added" or .status=="modified" or .status=="renamed") | [.status, .path, (.previous // .path)] | @tsv' "$MANIFEST" 2>/dev/null > /tmp/candidates.tsv || true
+
+          if [ ! -s /tmp/candidates.tsv ]; then
+            echo "No added, modified, or renamed markdown files in this PR."
+            echo "has_kbids=false" >> "$GITHUB_OUTPUT"
+            {
+              echo "# KB ID check report"
+              echo ""
+              echo "No markdown files added, modified, or renamed in this PR."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          # Read the exact-key awa-kb_id value from a file's frontmatter (case-insensitive
+          # key, quotes/space trimmed). Prints empty when absent.
+          get_kbid() {
+            sed '1s/^\xEF\xBB\xBF//' "$1" | tr -d '\r' | sed -n '2,/^---$/p' \
+              | grep -iE '^[[:space:]]*awa-kb_id[[:space:]]*:' | head -1 \
+              | sed -E 's/^[^:]*:[[:space:]]*//' | tr -d '[:space:]' | sed -E "s/^[\"']//; s/[\"']\$//"
+          }
+
+          PATTERN_FILE=$(mktemp)
+          echo "pattern_file=$PATTERN_FILE" >> "$GITHUB_OUTPUT"
+          : > /tmp/pr_kbid_files.tsv
+
+          FOUND=0
+          while IFS=$'\t' read -r status new_path old_path; do
+            src="$PR_FILES_DIR/$new_path"
+            [ -f "$src" ] || continue
+
+            KBID=$(get_kbid "$src")
+            [ -n "$KBID" ] || continue
+            FOUND=1
+
+            # Only integer values participate in the duplicate inventory; non-integer values
+            # are already failed by the validate step and must not pollute dedupe.
+            if printf '%s' "$KBID" | grep -qE '^[0-9]+$'; then
+              echo "$KBID" >> "$PATTERN_FILE"
+              printf '%s\t%s\n' "$KBID" "$new_path" >> /tmp/pr_kbid_files.tsv
+            fi
+            echo "Found awa-kb_id '$KBID' in $new_path"
+          done < /tmp/candidates.tsv
+
+          if [ "$FOUND" -eq 0 ]; then
+            echo "No kb_ids to check."
+            echo "has_kbids=false" >> "$GITHUB_OUTPUT"
+            rm -f "$PATTERN_FILE"
+          else
+            echo "has_kbids=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check for mistyped kb_id field name
+        id: typos
+        if: always()
+        run: |
+          LC_ALL=C
+          export LC_ALL
+
+          if [ ! -s /tmp/candidates.tsv ]; then
+            echo "has_typos=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          : > /tmp/typos.txt
+
+          # A key is a near-miss of awa-kb_id when it NORMALIZES (lowercase, drop every
+          # non-alphanumeric char) to "awakbid" but its lowercase form isn't exactly the
+          # valid key "awa-kb_id". The KB redirect pipeline matches the exact key, so these
+          # typos are silently dropped and no redirect is generated.
+          while IFS=$'\t' read -r status new_path old_path; do
+            src="$PR_FILES_DIR/$new_path"
+            [ -f "$src" ] || continue
+
+            # Frontmatter only (skip files without an opening '---').
+            head -1 "$src" | sed 's/^\xEF\xBB\xBF//' | tr -d '\r' | grep -q '^---$' || continue
+
+            # Base-side keys (lowercased) for modified/renamed files, so a typo that already
+            # existed on base and wasn't introduced by this PR isn't flagged. Stored in a
+            # temp file so the frontmatter pipe below (a subshell) can read it.
+            : > /tmp/base_keys.txt
+            if [ "$status" != "added" ]; then
+              git show "origin/$BASE_REF:$old_path" 2>/dev/null | sed '1s/^\xEF\xBB\xBF//' | tr -d '\r' | sed -n '2,/^---$/p' \
+                | grep -E '^[[:space:]]*[^:[:space:]][^:]*:' | sed -E 's/^[[:space:]]*//; s/[[:space:]]*:.*$//' | tr '[:upper:]' '[:lower:]' > /tmp/base_keys.txt
+            fi
+
+            # Scan the frontmatter keys directly (piped, no heredoc). The while runs in a
+            # pipeline subshell, which inherits $new_path from the parent shell.
+            sed '1s/^\xEF\xBB\xBF//' "$src" | tr -d '\r' | sed -n '2,/^---$/p' | while IFS= read -r line; do
+              case "$line" in *:*) : ;; *) continue ;; esac
+              KEY=$(printf '%s' "$line" | sed -E 's/^[[:space:]]*//; s/[[:space:]]*:.*$//')
+              [ -n "$KEY" ] || continue
+              KEY_LC=$(printf '%s' "$KEY" | tr '[:upper:]' '[:lower:]')
+              [ "$KEY_LC" = "awa-kb_id" ] && continue
+              NORM=$(printf '%s' "$KEY_LC" | tr -cd 'a-z0-9')
+              [ "$NORM" = "awakbid" ] || continue
+
+              # Skip if this key already existed (lowercased) on the base version.
+              if grep -qxF "$KEY_LC" /tmp/base_keys.txt; then
+                continue
+              fi
+
+              VALUE=$(printf '%s' "$line" | sed -E 's/^[^:]*:[[:space:]]*//' | tr -d '\r' | sed -E "s/[[:space:]]+\$//; s/^[\"']//; s/[\"']\$//")
+              printf '%s\t%s\t%s\n' "$new_path" "$KEY" "$VALUE" >> /tmp/typos.txt
+              echo "Mistyped kb_id key '$KEY' in $new_path"
+            done
+          done < /tmp/candidates.tsv
+
+          if [ -s /tmp/typos.txt ]; then
+            echo "has_typos=true" >> "$GITHUB_OUTPUT"
+            echo "::error::One or more articles use a mistyped awa-kb_id field name!"
+            {
+              echo "## Mistyped kb_id field name"
+              echo ""
+              echo "**The redirect pipeline only reads the exact key \`awa-kb_id\`.** These keys are near-misses and would be silently ignored:"
+              echo ""
+              echo "| File | Mistyped key |"
+              echo "|------|--------------|"
+              while IFS=$'\t' read -r file key _value; do
+                echo "| \`$file\` | \`$key\` |"
+              done < /tmp/typos.txt
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          echo "No mistyped kb_id field names."
+          echo "has_typos=false" >> "$GITHUB_OUTPUT"
+
+      - name: Validate kb_id values
+        id: validate
+        if: always()
+        run: |
+          LC_ALL=C
+          export LC_ALL
+
+          if [ ! -s /tmp/candidates.tsv ]; then
+            echo "has_invalid=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          get_kbid_from() {
+            # $1 = content on stdin already; read the exact-key value.
+            grep -iE '^[[:space:]]*awa-kb_id[[:space:]]*:' | head -1 \
+              | sed -E 's/^[^:]*:[[:space:]]*//' | tr -d '[:space:]' | sed -E "s/^[\"']//; s/[\"']\$//"
+          }
+
+          : > /tmp/invalid.txt
+
+          while IFS=$'\t' read -r status new_path old_path; do
+            src="$PR_FILES_DIR/$new_path"
+            [ -f "$src" ] || continue
+
+            CURRENT=$(sed '1s/^\xEF\xBB\xBF//' "$src" | tr -d '\r' | sed -n '2,/^---$/p' | get_kbid_from)
+            [ -n "$CURRENT" ] || continue
+
+            # Only validate values that are new or changed vs. base, so a PR that merely
+            # touches a file with a pre-existing bad value isn't blamed for it.
+            if [ "$status" != "added" ]; then
+              BASE=$(git show "origin/$BASE_REF:$old_path" 2>/dev/null | sed '1s/^\xEF\xBB\xBF//' | tr -d '\r' | sed -n '2,/^---$/p' | get_kbid_from)
+              [ "$BASE" = "$CURRENT" ] && continue
+            fi
+
+            # Valid = unsigned integer.
+            printf '%s' "$CURRENT" | grep -qE '^[0-9]+$' && continue
+
+            if printf '%s' "$CURRENT" | grep -qiE '^kb[-_ ]?[0-9]+$'; then
+              STRIPPED=$(printf '%s' "$CURRENT" | tr -cd '0-9')
+              printf '%s\t%s\t%s\t%s\n' "$new_path" "$CURRENT" "kb-prefix" "$STRIPPED" >> /tmp/invalid.txt
+              echo "kb_id '$CURRENT' in $new_path still has the KB prefix (stripped: $STRIPPED)"
+            else
+              printf '%s\t%s\t%s\t%s\n' "$new_path" "$CURRENT" "not-integer" "" >> /tmp/invalid.txt
+              echo "kb_id '$CURRENT' in $new_path is not an unsigned integer"
+            fi
+          done < /tmp/candidates.tsv
+
+          if [ -s /tmp/invalid.txt ]; then
+            echo "has_invalid=true" >> "$GITHUB_OUTPUT"
+            echo "::error::One or more awa-kb_id values are invalid!"
+            {
+              echo "## Invalid kb_id values"
+              echo ""
+              echo "**\`awa-kb_id\` must be an unsigned integer.** Fix the following:"
+              echo ""
+              echo "| File | Value | Problem |"
+              echo "|------|-------|---------|"
+              while IFS=$'\t' read -r file value kind stripped; do
+                case "$kind" in
+                  kb-prefix) prob="Has the \`KB\` prefix — remove it, then verify \`$stripped\`" ;;
+                  *) prob="Not an unsigned integer" ;;
+                esac
+                echo "| \`$file\` | \`$value\` | $prob |"
+              done < /tmp/invalid.txt
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          echo "All new/changed kb_id values are valid unsigned integers."
+          echo "has_invalid=false" >> "$GITHUB_OUTPUT"
+
+      - name: Check for duplicates across repo
+        id: dupes
+        if: always() && steps.extract.outputs.has_kbids == 'true'
+        run: |
+          LC_ALL=C
+          export LC_ALL
+
+          PATTERN_FILE="${{ steps.extract.outputs.pattern_file }}"
+
+          # Base-side paths touched by this PR (modified path, renamed-from previous, removed
+          # path). Excluded from the duplicate inventory so a file that simply keeps its own
+          # kb_id isn't flagged as a duplicate against its own base copy.
+          jq -r '.[] | (.previous // .path)' "$PR_FILES_DIR/_manifest.json" 2>/dev/null > /tmp/pr_base_paths.txt || true
+
+          # Full repo-wide kb_id map: EVERY awa-kb_id in the base tree -> kbid<TAB>file.
+          # Single filesystem scan (first 50 lines/file, since the value lives in
+          # frontmatter). Excludes ./pr-head so the PR's own files don't pollute the base
+          # inventory. Only integer values are recorded.
+          find . -name '*.md' -not -path '*/includes/*' -not -path './pr-head/*' -print0 | \
+            xargs -0 awk '
+              FNR == 1 { fn = FILENAME; sub(/^\.\//, "", fn) }
+              FNR > 50 { nextfile }
+              tolower($0) ~ /^[[:space:]]*awa-kb_id[[:space:]]*:/ {
+                val = $0
+                sub(/^[^:]*:[[:space:]]*/, "", val)
+                gsub(/[[:space:]]/, "", val)
+                gsub(/^["'"'"']|["'"'"']$/, "", val)
+                if (val ~ /^[0-9]+$/) print val "\t" fn
+                nextfile
+              }
+            ' > /tmp/base_all_kbid_files.tsv || true
+
+          # Restrict the full map to base files whose kb_id matches a PR kb_id (the "want"
+          # set, read as DATA) and that are NOT touched by this PR.
+          awk -F'\t' -v PF="$PATTERN_FILE" -v EX="/tmp/pr_base_paths.txt" '
+            BEGIN {
+              while ((getline g < PF) > 0) {
+                gsub(/[[:space:]]/, "", g)
+                if (length(g) > 0) want[g] = 1
+              }
+              while ((getline p < EX) > 0) {
+                if (length(p) > 0) exclude[p] = 1
+              }
+            }
+            { if (($1 in want) && !($2 in exclude)) print $1 "\t" $2 }
+          ' /tmp/base_all_kbid_files.tsv > /tmp/base_kbid_files.tsv || true
+
+          rm -f "$PATTERN_FILE"
+
+          # A kb_id is a duplicate if it already exists on the base branch, or if it appears
+          # in more than one file in this PR. Emit "kbid<TAB>file1|file2|..." (base first).
+          awk -F'\t' '
+            FNR == NR { files[$1] = files[$1] $2 "|"; base[$1] = 1; next }
+            {
+              files[$1] = files[$1] $2 "|"
+              prcount[$1]++
+              pr[$1] = 1
+            }
+            END {
+              for (k in pr) {
+                if (base[k] == 1 || prcount[k] > 1) print k "\t" files[k]
+              }
+            }
+          ' /tmp/base_kbid_files.tsv /tmp/pr_kbid_files.tsv > /tmp/dupes.txt || true
+
+          if [ -s /tmp/dupes.txt ]; then
+            echo "has_dupes=true" >> "$GITHUB_OUTPUT"
+            echo "::error::Duplicate awa-kb_id values found in this PR!"
+            {
+              echo "## Duplicate kb_ids"
+              echo ""
+              echo "**Duplicate kb_ids found.** The following values appear in multiple files:"
+              echo ""
+              echo "| kb_id | Files |"
+              echo "|-------|-------|"
+              while IFS=$'\t' read -r kbid filestr; do
+                files=$(echo "$filestr" | tr '|' ',' | sed 's/,$//' | sed 's|\./||g')
+                echo "| \`$kbid\` | $files |"
+              done < /tmp/dupes.txt
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          echo "All kb_ids in this PR are unique across the repository."
+          echo "has_dupes=false" >> "$GITHUB_OUTPUT"
+
+      - name: Check for changed or removed kb_ids
+        id: changed
+        if: always()
+        run: |
+          LC_ALL=C
+          export LC_ALL
+
+          MANIFEST="$PR_FILES_DIR/_manifest.json"
+
+          # Modified + renamed files — added files can't have a changed kb_id.
+          jq -r '.[] | select(.status=="modified" or .status=="renamed") | [.path, (.previous // .path)] | @tsv' "$MANIFEST" 2>/dev/null > /tmp/modified.tsv
+
+          if [ ! -s /tmp/modified.tsv ]; then
+            echo "No modified or renamed markdown files in this PR."
+            echo "has_changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          get_kbid_from() {
+            grep -iE '^[[:space:]]*awa-kb_id[[:space:]]*:' | head -1 \
+              | sed -E 's/^[^:]*:[[:space:]]*//' | tr -d '[:space:]' | sed -E "s/^[\"']//; s/[\"']\$//"
+          }
+
+          : > /tmp/changed_kbids.txt
+
+          while IFS=$'\t' read -r new_path old_path; do
+            case "$old_path" in */includes/*) continue ;; esac
+            case "$new_path" in */includes/*) continue ;; esac
+
+            src="$PR_FILES_DIR/$new_path"
+            [ -f "$src" ] || continue
+
+            CURRENT=$(sed '1s/^\xEF\xBB\xBF//' "$src" | tr -d '\r' | sed -n '2,/^---$/p' | get_kbid_from)
+            BASE=$(git show "origin/$BASE_REF:$old_path" 2>/dev/null | sed '1s/^\xEF\xBB\xBF//' | tr -d '\r' | sed -n '2,/^---$/p' | get_kbid_from)
+
+            # Nothing to protect if the base had no kb_id.
+            [ -n "$BASE" ] || continue
+
+            if [ -z "$CURRENT" ]; then
+              printf '%s\t%s\t%s\t%s\n' "$new_path" "$BASE" "(removed)" "removed" >> /tmp/changed_kbids.txt
+              echo "kb_id removed from $new_path (was $BASE) — error"
+            elif [ "$BASE" != "$CURRENT" ]; then
+              # If the new value is invalid, the validate step already owns it — don't
+              # double-flag the same line here.
+              if printf '%s' "$CURRENT" | grep -qE '^[0-9]+$'; then
+                printf '%s\t%s\t%s\t%s\n' "$new_path" "$BASE" "$CURRENT" "changed" >> /tmp/changed_kbids.txt
+                echo "kb_id changed in $new_path ($BASE -> $CURRENT) — error"
+              fi
+            fi
+          done < /tmp/modified.tsv
+
+          if [ -s /tmp/changed_kbids.txt ]; then
+            echo "has_changed=true" >> "$GITHUB_OUTPUT"
+            echo "::error::One or more awa-kb_id values were changed or removed!"
+            {
+              echo "## Changed / removed kb_ids"
+              echo ""
+              echo "**Existing articles must keep their \`awa-kb_id\`.** Restore each value:"
+              echo ""
+              echo "| File | Original kb_id | Changed to |"
+              echo "|------|----------------|------------|"
+              while IFS=$'\t' read -r file base current reason; do
+                echo "| \`$file\` | \`$base\` | \`$current\` |"
+              done < /tmp/changed_kbids.txt
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          echo "No disallowed kb_id changes or removals."
+          echo "has_changed=false" >> "$GITHUB_OUTPUT"
+
+      - name: Post inline kb_id comments
+        if: always()
+        uses: actions/github-script@v8
+        with:
+          github-token: ${{ secrets.AccessToken }}
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            const { execFileSync } = require('child_process');
+
+            // Triple backtick built as a variable so it doesn't clash with JS template literals.
+            const F = String.fromCharCode(96, 96, 96);
+            const MARKER = '<!-- kbidcheck-suggestion -->';
+            const prFilesDir = process.env.PR_FILES_DIR;
+            const baseRef = process.env.GITHUB_BASE_REF || process.env.BASE_REF || 'main';
+            const pr = context.payload.pull_request;
+            const commitId = pr.head.sha;
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const prNumber = pr.number;
+
+            // The "Commit suggestion" (Apply) button only renders for viewers who can push
+            // to the PR's head branch. On a fork PR the contributor owns the fork branch and
+            // can Apply, so a ```suggestion``` block is useful. On a same-repo PR we show the
+            // value as plain text instead.
+            const isFork = !!(pr.head.repo && pr.head.repo.full_name
+              && pr.head.repo.full_name !== (owner + '/' + repo));
+
+            function readTsv(p) {
+              try {
+                const t = fs.readFileSync(p, 'utf8').trim();
+                return t ? t.split('\n') : [];
+              } catch (e) { return []; }
+            }
+            function fileLines(rel) {
+              return fs.readFileSync(path.join(prFilesDir, rel), 'utf8').replace(/\r/g, '').split('\n');
+            }
+            function escapeRe(s) { return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
+            function lineMatching(rel, re) {
+              try {
+                const lines = fileLines(rel);
+                for (let i = 0; i < lines.length; i++) {
+                  if (re.test(lines[i])) return i + 1;
+                }
+              } catch (e) {}
+              return null;
+            }
+            function kbidLine(rel) { return lineMatching(rel, /^\s*awa-kb_id\s*:/i); }
+            function firstLine(rel) {
+              try { return fileLines(rel)[0] || '---'; } catch (e) { return '---'; }
+            }
+            function hadKbidOnBase(file, kbid) {
+              try {
+                const content = execFileSync('git', ['show', 'origin/' + baseRef + ':' + file], {
+                  encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'],
+                });
+                const m = content.match(/awa-kb_id\s*:\s*["']?(\S+?)["']?\s*$/im);
+                return m && m[1] === kbid;
+              } catch (e) { return false; }
+            }
+
+            // Comment body with a one-click suggestion on fork PRs; plain code block otherwise.
+            function mkBody(intro, fixLines) {
+              if (isFork) {
+                return intro + ' Click **Commit suggestion** to apply.\n\n'
+                  + F + 'suggestion\n' + fixLines + '\n' + F + '\n' + MARKER;
+              }
+              return intro + ' Update the value as shown:\n\n'
+                + F + '\n' + fixLines + '\n' + F + '\n' + MARKER;
+            }
+            // Plain note (no suggestion block) — used when there is no one-click fix to offer.
+            function mkNote(text) { return text + '\n\n' + MARKER; }
+
+            // Remove our previous comments so re-runs don't pile up.
+            const oldReview = await github.paginate(github.rest.pulls.listReviewComments, {
+              owner, repo, pull_number: prNumber, per_page: 100,
+            });
+            for (const c of oldReview) {
+              if (c.body && c.body.includes(MARKER)) {
+                try { await github.rest.pulls.deleteReviewComment({ owner, repo, comment_id: c.id }); } catch (e) {}
+              }
+            }
+            const oldIssue = await github.paginate(github.rest.issues.listComments, {
+              owner, repo, issue_number: prNumber, per_page: 100,
+            });
+            for (const c of oldIssue) {
+              if ((c.body || '').includes(MARKER)) {
+                try { await github.rest.issues.deleteComment({ owner, repo, comment_id: c.id }); } catch (e) {}
+              }
+            }
+
+            const items = [];
+
+            // Mistyped field-name key: rename it to the exact key awa-kb_id.
+            for (const ln of readTsv('/tmp/typos.txt')) {
+              const parts = ln.split('\t');
+              const file = parts[0]; const key = parts[1]; const value = parts[2] || '';
+              if (!file || !key) continue;
+              const gl = lineMatching(file, new RegExp('^\\s*' + escapeRe(key) + '\\s*:', 'i')) || 1;
+              const intro = '**Mistyped `awa-kb_id` field name.** The KB redirect pipeline only reads the exact key `awa-kb_id`; `'
+                + key + '` is ignored, so no redirect would be generated.';
+              if (value) {
+                items.push({ file, line: gl, body: mkBody(intro, 'awa-kb_id: ' + value) });
+              } else {
+                items.push({ file, line: gl, body: mkNote(intro + ' Rename the key to `awa-kb_id`.') });
+              }
+            }
+
+            // Invalid value: KB-prefix (offer stripped value) or other non-integer (note only).
+            for (const ln of readTsv('/tmp/invalid.txt')) {
+              const parts = ln.split('\t');
+              const file = parts[0]; const value = parts[1]; const kind = parts[2]; const stripped = parts[3] || '';
+              if (!file) continue;
+              const gl = kbidLine(file) || 1;
+              if (kind === 'kb-prefix') {
+                const intro = '**`awa-kb_id` still has the `KB` prefix** (`' + value + '`). This is a common copy/paste error \u2014 '
+                  + 'remove the leading `KB` and **verify the remaining digits `' + stripped + '` are the correct KB number**.';
+                items.push({ file, line: gl, body: mkBody(intro, 'awa-kb_id: ' + stripped) });
+              } else {
+                items.push({ file, line: gl, body: mkNote(
+                  '**Invalid `awa-kb_id`** (`' + value + '`). It must be an unsigned integer (digits only).') });
+              }
+            }
+
+            // Changed / removed kb_id: restore the base value.
+            for (const ln of readTsv('/tmp/changed_kbids.txt')) {
+              const parts = ln.split('\t');
+              const file = parts[0]; const base = parts[1]; const current = parts[2]; const reason = parts[3] || '';
+              if (!file) continue;
+              if (reason === 'removed') {
+                items.push({ file, line: 1, body: mkBody(
+                  '**`awa-kb_id` was removed.** Existing articles must keep their kb_id.',
+                  firstLine(file) + '\nawa-kb_id: ' + base) });
+              } else {
+                const gl = kbidLine(file);
+                if (gl) {
+                  items.push({ file, line: gl, body: mkBody(
+                    '**`awa-kb_id` was changed** (`' + base + '` \u2192 `' + current + '`). Existing articles must keep their kb_id.',
+                    'awa-kb_id: ' + base) });
+                }
+              }
+            }
+
+            // Duplicate kb_id: name the colliding file(s). No generated value — the author
+            // must supply the correct unique KB ID.
+            for (const ln of readTsv('/tmp/dupes.txt')) {
+              const parts = ln.split('\t');
+              const kbid = parts[0]; const fileStr = parts[1];
+              if (!kbid || !fileStr) continue;
+              const all = fileStr.split('|').filter(Boolean).map(function (f) { return f.replace(/^\.\//, ''); });
+              const keep = all.filter(function (f) { return hadKbidOnBase(f, kbid); });
+              let change = all.filter(function (f) { return !hadKbidOnBase(f, kbid); });
+              if (keep.length === 0 && change.length > 1) change = change.slice(1);
+              const retained = all.filter(function (f) { return change.indexOf(f) === -1; });
+              for (const f of change) {
+                const gl = kbidLine(f);
+                if (gl) {
+                  const others = retained.filter(function (x) { return x !== f; });
+                  const usedBy = others.length
+                    ? 'already used by ' + others.map(function (x) { return '`' + x + '`'; }).join(', ')
+                    : 'used by more than one file in this PR';
+                  items.push({ file: f, line: gl, body: mkNote(
+                    '**Duplicate `awa-kb_id`** \u2014 `' + kbid + '` is ' + usedBy
+                      + '. Each article needs its own unique KB ID; set this one to the correct KB number for this article.') });
+                }
+              }
+            }
+
+            let posted = 0, fallback = 0;
+            for (const it of items) {
+              try {
+                await github.rest.pulls.createReviewComment({
+                  owner, repo, pull_number: prNumber, commit_id: commitId,
+                  path: it.file, line: it.line, side: 'RIGHT', body: it.body,
+                });
+                posted++;
+              } catch (e) {
+                core.warning('Inline comment failed for ' + it.file + ':' + it.line + ' (' + e.message + '); posting a plain comment.');
+                try {
+                  await github.rest.issues.createComment({
+                    owner, repo, issue_number: prNumber,
+                    body: it.body + '\n\n_(Could not attach inline on `' + it.file + '`.)_',
+                  });
+                  fallback++;
+                } catch (e2) {}
+              }
+            }
+            core.info('Posted ' + posted + ' inline comment(s), ' + fallback + ' fallback comment(s).');
+
+      - name: KB ID check results summary
+        if: always()
+        env:
+          TYPOS_OUTCOME: ${{ steps.typos.outcome }}
+          INVALID_OUTCOME: ${{ steps.validate.outcome }}
+          DUPES_OUTCOME: ${{ steps.dupes.outcome }}
+          CHANGED_OUTCOME: ${{ steps.changed.outcome }}
+        run: |
+          LC_ALL=C
+          export LC_ALL
+
+          count_lines() { if [ -f "$1" ]; then awk 'NF' "$1" | wc -l | tr -d ' '; else echo 0; fi; }
+          TYPOS=$(count_lines /tmp/typos.txt)
+          INVALID=$(count_lines /tmp/invalid.txt)
+          CHANGED=$(count_lines /tmp/changed_kbids.txt)
+
+          # Duplicate files needing a fix = sum over dupe groups of (files in group - 1 owner).
+          DUPES=0
+          if [ -f /tmp/dupes.txt ]; then
+            while IFS=$'\t' read -r _kbid files; do
+              n=$(printf '%s' "$files" | tr '|' '\n' | awk 'NF' | wc -l | tr -d ' ')
+              if [ "$n" -gt 1 ]; then DUPES=$((DUPES + n - 1)); fi
+            done < /tmp/dupes.txt
+          fi
+
+          result() {
+            if [ "$1" = "skipped" ]; then printf ':heavy_minus_sign: Not run';
+            elif [ "${2:-0}" -gt 0 ]; then printf ':x: Fail';
+            else printf ':white_check_mark: Pass'; fi
+          }
+
+          TOTAL=$((TYPOS + INVALID + DUPES + CHANGED))
+          if [ "$TOTAL" -gt 0 ]; then
+            OVERALL=":x: **Failed** - resolve the $TOTAL flagged file(s). See the inline review comments for the fix on each."
+          else
+            OVERALL=":white_check_mark: **Passed** - all article kb_ids are valid and unique."
+          fi
+
+          {
+            echo "# KB ID check results"
+            echo ""
+            echo "$OVERALL"
+            echo ""
+            echo "| Check | Result | Files |"
+            echo "| --- | :---: | ---: |"
+            echo "| Mistyped kb_id field name | $(result "$TYPOS_OUTCOME" "$TYPOS") | $TYPOS |"
+            echo "| Invalid kb_id value | $(result "$INVALID_OUTCOME" "$INVALID") | $INVALID |"
+            echo "| Duplicate kb_id | $(result "$DUPES_OUTCOME" "$DUPES") | $DUPES |"
+            echo "| Changed / removed kb_id | $(result "$CHANGED_OUTCOME" "$CHANGED") | $CHANGED |"
+          } >> "$GITHUB_STEP_SUMMARY"
