@@ -137,6 +137,10 @@ jobs:
                 $Repository = $GitHubData.event.repository.name
                 $Organization = $GitHubData.event.organization.login
                 $DefaultBranch = $GitHubData.event.repository.default_branch
+                # Base branches eligible for the on-demand commands: the default branch, plus servicing release branches
+                # (for example, "release-2026-7d" or "release-8b/260811-1000"). Release-branch PRs are merge-only -
+                # AutoPublish publishes the default branch to live, so it can't publish release-branch content.
+                $ReleaseBranchPattern = "release-*"
                 $RepoLabelUrl = $GitHubData.event.repository.labels_url
                 $TrackingRepoLabelUrl = "https://api.github.com/repos/$TrackingRepoOrganization/$TrackingRepoName/labels{/name}"
 
@@ -179,7 +183,7 @@ jobs:
                 #####################
                 # Scenario-agnostic response messages
 
-                $WrongBaseBranchResponse = "${MentionPrefix}On-demand self publishing is only available for pull requests targeting the default branch (``$DefaultBranch``). This PR targets a different branch.`n`nIf you have questions, post a message to https://aka.ms/tcphelp."
+                $WrongBaseBranchResponse = "${MentionPrefix}On-demand self publishing is only available for pull requests targeting the default branch (``$DefaultBranch``) or a release branch (``$ReleaseBranchPattern``). This PR targets a different branch.`n`nIf you have questions, post a message to https://aka.ms/tcphelp."
                 $MergeSucceededResponse = "${MentionPrefix}We've merged this pull request and triggered AutoPublish. Changes will be published to the ``$TargetBranch`` branch shortly.`n`nIf you have questions, post a message to https://aka.ms/tcphelp."
                 $PublishTriggeredResponse = "${MentionPrefix}We've triggered AutoPublish. Changes will be published to the ``$TargetBranch`` branch shortly."
                 $PublishFailedResponse = "${MentionPrefix}We couldn't trigger AutoPublish. Post ``$PublishCommand`` again to retry, or contact PubOps.`n`nIf you have questions, post a message to https://aka.ms/tcphelp."
@@ -1013,6 +1017,25 @@ jobs:
 
                 #####################
                 #####################
+                # Test-SupportedBaseBranch
+
+                # Returns $True when a PR's base branch is eligible for the on-demand commands: the default branch, or a
+                # servicing release branch matching $ReleaseBranchPattern.
+                Function Test-SupportedBaseBranch {
+
+                    [CmdletBinding()]
+                    param(
+
+                        [string]$BaseRef
+
+                    )
+
+                    Return ($BaseRef -eq $DefaultBranch) -or ($BaseRef -like $ReleaseBranchPattern)
+
+                }
+
+                #####################
+                #####################
                 # Invoke-AutoPublish
 
                 # Triggers the caller repo's AutoPublish workflow via workflow_dispatch. The caller workflow must declare
@@ -1235,9 +1258,11 @@ jobs:
 
                 # Unified command flow (both "#trusted-publish" and its "#trusted-merge" alias):
                 #   1. Authorized under a scenario (AfterHours enforces its time window; Servicing is any time).
-                #   2. PR targets the default branch.
+                #   2. PR targets the default branch or a release branch.
                 #   3. If the PR isn't merged yet, it must be a non-draft in a mergeable state - then merge it.
-                #   4. Trigger AutoPublish. Reposting on an already-merged PR retries a failed dispatch.
+                #   4. Trigger AutoPublish, unless the PR targets a release branch (merge-only - AutoPublish publishes the
+                #      default branch, so it can't publish release-branch content).
+                #      Reposting on an already-merged default-branch PR retries a failed dispatch.
 
                 If ($Null -eq $Scenario) {
 
@@ -1264,10 +1289,26 @@ jobs:
 
                 $PrData = Invoke-RestMethod -Uri $PrApiUrl -Headers $StandardGitHubHeaders
 
-                If ($PrData.base.ref -ne $DefaultBranch) {
+                $BaseRef = $PrData.base.ref
 
-                    Write-Host "PR #$PrNumber targets `"$($PrData.base.ref)`", not the default branch `"$DefaultBranch`". Rejecting $Command."
+                If (!(Test-SupportedBaseBranch -BaseRef $BaseRef)) {
+
+                    Write-Host "PR #$PrNumber targets `"$BaseRef`", which is neither the default branch `"$DefaultBranch`" nor a release branch (`"$ReleaseBranchPattern`"). Rejecting $Command."
                     Add-PrComment -IssueUrl $IssueUrl -Body $WrongBaseBranchResponse
+                    Return
+
+                }
+
+                # Release-branch PRs are merge-only. AutoPublish takes the default branch to live, so triggering it for a
+                # release-branch PR would publish unrelated default-branch content instead of this PR's changes.
+                $IsReleaseBranchPr = $BaseRef -ne $DefaultBranch
+
+                # An already-merged release-branch PR has nothing left to do - there's no publish step to retry.
+                If ($IsReleaseBranchPr -and $PrData.merged) {
+
+                    Write-Host "PR #$PrNumber is already merged into release branch `"$BaseRef`". Nothing to do for $Command."
+                    $AlreadyMergedReleaseBody = "${MentionPrefix}This pull request has already been merged into the ``$BaseRef`` branch.`n`nAutoPublish only publishes the ``$DefaultBranch`` branch to ``$TargetBranch``, so there's nothing to publish on demand. These changes go live when the ``$BaseRef`` release branch ships.`n`nIf you have questions, post a message to https://aka.ms/tcphelp."
+                    Add-PrComment -IssueUrl $IssueUrl -Body $AlreadyMergedReleaseBody
                     Return
 
                 }
@@ -1343,6 +1384,20 @@ jobs:
                     }
 
                     $MergedByCommand = $True
+
+                }
+
+                # Release-branch PRs stop here: the merge is the whole operation. AutoPublish publishes the default branch
+                # to live, so dispatching it now would publish unrelated content rather than this PR's changes.
+                If ($IsReleaseBranchPr) {
+
+                    Write-Host "PR #$PrNumber merged into release branch `"$BaseRef`" via $Command. Skipping AutoPublish."
+
+                    $ReleaseMergeBody = "${MentionPrefix}We've merged this pull request into the ``$BaseRef`` branch.`n`nAutoPublish only publishes the ``$DefaultBranch`` branch to ``$TargetBranch``, so we haven't triggered it. These changes go live when the ``$BaseRef`` release branch ships.`n`nIf you have questions, post a message to https://aka.ms/tcphelp."
+                    Add-PrComment -IssueUrl $IssueUrl -Body $ReleaseMergeBody
+                    $ActionTaken = "Merged into release branch ``$BaseRef`` via ``$Command`` command. ``$OnDemandLabel`` label applied; AutoPublish not triggered (release branch)."
+                    Record-TrackingActivity -Action $ActionTaken -Scenario $Scenario
+                    Return
 
                 }
 
