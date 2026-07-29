@@ -67,9 +67,12 @@ jobs:
 
                 TrackingRepoOrganization: MicrosoftDocs        # Repo where tracking issues are created for PubOps to review on-demand publishing activity.
                 TrackingRepoName: tcp-mgmt-pr
-                OnDemandLabel: OnDemandPublish                 # Same label on opted-in caller PRs (PubOps/documentary marking) and on tracking issues (for PubOps filtering).
+                OnDemandLabel: OnDemandPublish                 # Applied to a PR when AutoPublish is dispatched for it, and to tracking issues (for PubOps filtering).
                 OnDemandLabelColor: "5319E7"                   # Quoted to prevent YAML from parsing as scientific notation (5319e7 = 53190000000).
-                OnDemandLabelDescription: On-demand self publishing activity. Applied to opted-in pull requests and to tracking issues in MicrosoftDocs/tcp-mgmt-pr.
+                OnDemandLabelDescription: On-demand publish activity. Applied to pull requests published on demand, and to tracking issues in MicrosoftDocs/tcp-mgmt-pr.
+                OnDemandMergeLabel: OnDemandMerge              # Applied to a PR when a command merges it. Kept separate from the publish label so the two actions can be analyzed independently.
+                OnDemandMergeLabelColor: "1D76DB"              # Quoted for the same reason as the publish label color.
+                OnDemandMergeLabelDescription: On-demand merge activity. Applied to pull requests merged by the #trusted-merge or #trusted-publish command.
                 AutoPublishWorkflowFile: AutoPublish.yml       # Filename of the caller repo's AutoPublish workflow to dispatch.
 
                 AccessToken: ${{ secrets.AccessToken }}
@@ -101,6 +104,9 @@ jobs:
                 $OnDemandLabel = $env:OnDemandLabel
                 $OnDemandLabelColor = $env:OnDemandLabelColor
                 $OnDemandLabelDescription = $env:OnDemandLabelDescription
+                $OnDemandMergeLabel = $env:OnDemandMergeLabel
+                $OnDemandMergeLabelColor = $env:OnDemandMergeLabelColor
+                $OnDemandMergeLabelDescription = $env:OnDemandMergeLabelDescription
                 $AutoPublishWorkflowFile = $env:AutoPublishWorkflowFile
 
                 # Parse the comma-separated app slug list into a trimmed array. Empty or unset becomes an empty array.
@@ -143,6 +149,10 @@ jobs:
                 $ReleaseBranchPattern = "release-*"
                 $RepoLabelUrl = $GitHubData.event.repository.labels_url
                 $TrackingRepoLabelUrl = "https://api.github.com/repos/$TrackingRepoOrganization/$TrackingRepoName/labels{/name}"
+                # Separator between the tracking issue's machine-readable title marker and the PR title. Shared by the
+                # issue builder and the lookup so the two can't drift - the lookup depends on it to avoid matching a
+                # longer PR number (marker "...#56" would otherwise prefix-match the issue for PR #561).
+                $TrackingTitleSeparator = " - "
 
                 # Is this repo eligible for the servicing scenario? Match on the configured prefix.
                 # TEMPORARY: also allow "max-cpub-test" so the bot path can be exercised end-to-end. Remove before production.
@@ -170,11 +180,12 @@ jobs:
                 $MentionPrefix = If ($IsBotSubmitter) { "" } Else { "@$Submitter " }
 
                 # Command constants. The caller gates on the shared "#trusted-" prefix; this workflow owns the list of
-                # commands it actually supports. "#trusted-merge" is a backward-compatible alias for "#trusted-publish":
-                # both run the unified flow that merges the PR if needed and then triggers AutoPublish.
+                # commands it actually supports. The two commands are distinct operations:
+                #   "#trusted-merge"   - merges the PR and stops. Never dispatches AutoPublish.
+                #   "#trusted-publish" - superset: merges the PR if it isn't merged yet, then dispatches AutoPublish.
+                $MergeCommand = "#trusted-merge"
                 $PublishCommand = "#trusted-publish"
-                $PublishCommandAlias = "#trusted-merge"
-                $SupportedCommands = @($PublishCommand, $PublishCommandAlias)
+                $SupportedCommands = @($MergeCommand, $PublishCommand)
 
                 # Scenario tags. Set later based on which gating path the submitter clears.
                 $ScenarioAfterHours = "AfterHours"
@@ -187,6 +198,12 @@ jobs:
                 $MergeSucceededResponse = "${MentionPrefix}We've merged this pull request and triggered AutoPublish. Changes will be published to the ``$TargetBranch`` branch shortly.`n`nIf you have questions, post a message to https://aka.ms/tcphelp."
                 $PublishTriggeredResponse = "${MentionPrefix}We've triggered AutoPublish. Changes will be published to the ``$TargetBranch`` branch shortly."
                 $PublishFailedResponse = "${MentionPrefix}We couldn't trigger AutoPublish. Post ``$PublishCommand`` again to retry, or contact PubOps.`n`nIf you have questions, post a message to https://aka.ms/tcphelp."
+
+                # "#trusted-merge" outcome messages. Merging the default branch still publishes on the next scheduled
+                # AutoPublish run, so the response says so rather than implying the change won't go live. Release-branch
+                # content publishes only when the release branch itself ships.
+                $MergedOnlyResponse = "${MentionPrefix}We've merged this pull request. We haven't triggered AutoPublish, so these changes will publish to the ``$TargetBranch`` branch on the next scheduled publish run (usually within a few hours).`n`nTo publish now instead of waiting, post ``$PublishCommand`` on this pull request.`n`nIf you have questions, post a message to https://aka.ms/tcphelp."
+                $AlreadyMergedResponse = "${MentionPrefix}This pull request has already been merged. Post ``$PublishCommand`` to publish the merged changes now, or wait for the next scheduled publish run.`n`nIf you have questions, post a message to https://aka.ms/tcphelp."
 
                 #####################
                 # After-hours scenario response messages
@@ -860,8 +877,11 @@ jobs:
 
                         $Response = Invoke-RestMethod -Uri $ListUri -Headers $AppGitHubAccessHeaders -Method Get -FollowRelLink -ErrorAction Stop
 
-                        # -FollowRelLink returns one array per page. Flatten and filter to those whose title begins with the marker.
-                        $Match = $Response | ForEach-Object { $_ } | Where-Object { $_.title -and $_.title.StartsWith($TitleMarker) } | Select-Object -First 1
+                        # -FollowRelLink returns one array per page. Flatten and filter to those whose title begins with the marker
+                        # plus its separator. Matching the bare marker would also match a longer PR number - the marker for PR #56
+                        # is a prefix of the title for PR #561 - and attach this PR's activity to the wrong issue.
+                        $MatchPrefix = "$TitleMarker$TrackingTitleSeparator"
+                        $Match = $Response | ForEach-Object { $_ } | Where-Object { $_.title -and $_.title.StartsWith($MatchPrefix) } | Select-Object -First 1
 
                         If ($Match) {
 
@@ -903,7 +923,7 @@ jobs:
 
                     }
 
-                    $IssueTitle = "$TitleMarker - $PrTitle"
+                    $IssueTitle = "$TitleMarker$TrackingTitleSeparator$PrTitle"
                     $IssueBody = "An on-demand publishing command was submitted on a pull request. PubOps should review the changes in the PR against PR criteria and close this issue once any required fixes are resolved.`n`n" +
                                  "- **Scenario**: $Scenario`n" +
                                  "- **Repo**: ``$Organization/$Repository```n" +
@@ -992,7 +1012,8 @@ jobs:
                     param(
 
                         [string]$Action,
-                        [string]$Scenario
+                        [string]$Scenario,
+                        [switch]$CreateIfMissing
 
                     )
 
@@ -1005,13 +1026,49 @@ jobs:
 
                         Update-TrackingIssue -TrackingIssueUrl $TrackingIssue.url -Action $Action -Scenario $Scenario
 
-                    } Else {
+                    } ElseIf ($CreateIfMissing) {
 
                         Write-Host "No existing tracking issue. Creating a new one."
 
                         New-TrackingIssue -TitleMarker $TitleMarker -Action $Action -Scenario $Scenario | Out-Null
 
+                    } Else {
+
+                        # The PubOps review gate is content reaching the default branch: once it's there it publishes on
+                        # the next scheduled run regardless. A run that merged nothing introduces no new content, and a
+                        # release-branch merge doesn't reach the default branch (the PR that later brings the release
+                        # branch into it is that content's gate). Neither warrants a fresh review item - the labels on
+                        # the PR are the record.
+                        Write-Host "No open tracking issue, and this run didn't merge anything into `"$DefaultBranch`". Not creating one."
+
                     }
+
+                }
+
+                #####################
+                #####################
+                # Add-OnDemandLabel
+
+                # Ensures a label exists on the caller repo, then applies it to the PR. Labels record what the command
+                # actually did, so callers invoke this only after the corresponding action has succeeded.
+                Function Add-OnDemandLabel {
+
+                    [CmdletBinding()]
+                    param(
+
+                        [string]$Name,
+                        [string]$Color,
+                        [string]$Description
+
+                    )
+
+                    If (!(Test-RepoLabel -RepoUri $RepoLabelUrl -Name $Name)) {
+
+                        New-RepoLabel -RepoUri $RepoLabelUrl -Name $Name -Color $Color -Description $Description
+
+                    }
+
+                    Set-PrLabel -IssueUrl $IssueUrl -LabelName $Name
 
                 }
 
@@ -1172,7 +1229,7 @@ jobs:
 
                     If (!$IsBotSubmitter) {
 
-                        $UnsupportedCommandResponse = "${MentionPrefix}The command ``$Command`` isn't supported. Use ``$PublishCommand`` to merge this pull request if needed and trigger publishing.`n`nIf you have questions, post a message to https://aka.ms/tcphelp."
+                        $UnsupportedCommandResponse = "${MentionPrefix}The command ``$Command`` isn't supported. Use ``$MergeCommand`` to merge this pull request, or ``$PublishCommand`` to merge it if needed and publish it now.`n`nIf you have questions, post a message to https://aka.ms/tcphelp."
                         Add-PrComment -IssueUrl $IssueUrl -Body $UnsupportedCommandResponse
 
                     }
@@ -1256,13 +1313,15 @@ jobs:
 
                 }
 
-                # Unified command flow (both "#trusted-publish" and its "#trusted-merge" alias):
+                # Command flow. Both commands share the same gates; they differ only in whether AutoPublish is dispatched:
                 #   1. Authorized under a scenario (AfterHours enforces its time window; Servicing is any time).
                 #   2. PR targets the default branch or a release branch.
-                #   3. If the PR isn't merged yet, it must be a non-draft in a mergeable state - then merge it.
-                #   4. Trigger AutoPublish, unless the PR targets a release branch (merge-only - AutoPublish publishes the
-                #      default branch, so it can't publish release-branch content).
-                #      Reposting on an already-merged default-branch PR retries a failed dispatch.
+                #   3. "#trusted-publish" is rejected on release branches - AutoPublish publishes the default branch, so
+                #      the publish half can never be satisfied. Nothing is merged; the submitter is sent to
+                #      "#trusted-merge" so a command either does everything it promises or nothing at all.
+                #   4. If the PR isn't merged yet, it must be a non-draft in a mergeable state - then merge it.
+                #   5. "#trusted-merge" stops there. "#trusted-publish" dispatches AutoPublish, and reposting it on an
+                #      already-merged default-branch PR retries a failed dispatch.
 
                 If ($Null -eq $Scenario) {
 
@@ -1299,16 +1358,52 @@ jobs:
 
                 }
 
-                # Release-branch PRs are merge-only. AutoPublish takes the default branch to live, so triggering it for a
-                # release-branch PR would publish unrelated default-branch content instead of this PR's changes.
+                # AutoPublish takes the default branch to live, so it can never publish release-branch content.
                 $IsReleaseBranchPr = $BaseRef -ne $DefaultBranch
 
-                # An already-merged release-branch PR has nothing left to do - there's no publish step to retry.
-                If ($IsReleaseBranchPr -and $PrData.merged) {
+                # Verb used in the shared rejection messages so each command describes what it was actually attempting.
+                $CommandVerb = If ($Command -eq $MergeCommand) { "merge" } Else { "publish" }
 
-                    Write-Host "PR #$PrNumber is already merged into release branch `"$BaseRef`". Nothing to do for $Command."
-                    $AlreadyMergedReleaseBody = "${MentionPrefix}This pull request has already been merged into the ``$BaseRef`` branch.`n`nAutoPublish only publishes the ``$DefaultBranch`` branch to ``$TargetBranch``, so there's nothing to publish on demand. These changes go live when the ``$BaseRef`` release branch ships.`n`nIf you have questions, post a message to https://aka.ms/tcphelp."
-                    Add-PrComment -IssueUrl $IssueUrl -Body $AlreadyMergedReleaseBody
+                # "#trusted-publish" promises merge *and* publish. On a release branch the publish half can never be
+                # satisfied, so reject before touching the PR - a command should do everything it promises or nothing.
+                If (($Command -eq $PublishCommand) -and $IsReleaseBranchPr) {
+
+                    Write-Host "PR #$PrNumber targets release branch `"$BaseRef`". AutoPublish only publishes `"$DefaultBranch`". Rejecting $PublishCommand."
+                    $ReleasePublishBody = "${MentionPrefix}We can't publish this pull request. It targets the ``$BaseRef`` release branch, and AutoPublish only publishes the ``$DefaultBranch`` branch to ``$TargetBranch``.`n`nPost ``$MergeCommand`` to merge this pull request instead. These changes go live when the ``$BaseRef`` release branch ships.`n`nIf you have questions, post a message to https://aka.ms/tcphelp."
+                    Add-PrComment -IssueUrl $IssueUrl -Body $ReleasePublishBody
+                    Return
+
+                }
+
+                # "#trusted-merge" on an already-merged PR has nothing left to do.
+                If (($Command -eq $MergeCommand) -and $PrData.merged) {
+
+                    Write-Host "PR #$PrNumber is already merged. Nothing to do for $MergeCommand."
+
+                    $AlreadyMergedBody = If ($IsReleaseBranchPr) {
+
+                        "${MentionPrefix}This pull request has already been merged into the ``$BaseRef`` branch.`n`nAutoPublish only publishes the ``$DefaultBranch`` branch to ``$TargetBranch``, so there's nothing to publish on demand. These changes go live when the ``$BaseRef`` release branch ships.`n`nIf you have questions, post a message to https://aka.ms/tcphelp."
+
+                    } Else {
+
+                        $AlreadyMergedResponse
+
+                    }
+
+                    Add-PrComment -IssueUrl $IssueUrl -Body $AlreadyMergedBody
+                    Return
+
+                }
+
+                # A closed-but-unmerged PR can't be merged, and neither command can do anything useful with it.
+                # GitHub still reports a mergeable_state of "clean" or "unstable" for closed PRs, so without this
+                # check the flow would clear every gate, label the PR, and then fail at the merge endpoint with a
+                # raw HTTP error. Check before any side effect so a closed PR is left untouched.
+                If (!$PrData.merged -and $PrData.state -eq "closed") {
+
+                    Write-Host "PR #$PrNumber is closed and was not merged. Rejecting $Command."
+                    $ClosedPrBody = "${MentionPrefix}We can't $CommandVerb this pull request. It's closed and wasn't merged.`n`nReopen the pull request and post ``$Command`` again.`n`nIf you have questions, post a message to https://aka.ms/tcphelp."
+                    Add-PrComment -IssueUrl $IssueUrl -Body $ClosedPrBody
                     Return
 
                 }
@@ -1324,7 +1419,7 @@ jobs:
                     If ($PrData.draft) {
 
                         Write-Host "PR #$PrNumber is a draft. Rejecting $Command."
-                        $DraftRejectionBody = "${MentionPrefix}We can't publish this pull request yet. The PR is a draft. Mark it as ready for review and post ``$PublishCommand`` again.`n`nIf you have questions, post a message to https://aka.ms/tcphelp."
+                        $DraftRejectionBody = "${MentionPrefix}We can't $CommandVerb this pull request yet. The PR is a draft. Mark it as ready for review and post ``$Command`` again.`n`nIf you have questions, post a message to https://aka.ms/tcphelp."
                         Add-PrComment -IssueUrl $IssueUrl -Body $DraftRejectionBody
                         Return
 
@@ -1347,7 +1442,7 @@ jobs:
                             "unknown"  { "GitHub hasn't finished computing the mergeable state. Try again in a moment." }
                             default    { "GitHub reports the PR isn't ready to merge (state: ``$MergeableState``)." }
                         }
-                        $RejectionBody = "${MentionPrefix}We can't publish this pull request yet. $StateExplanation`n`nResolve the issue and post ``$PublishCommand`` again.`n`nIf you have questions, post a message to https://aka.ms/tcphelp."
+                        $RejectionBody = "${MentionPrefix}We can't $CommandVerb this pull request yet. $StateExplanation`n`nResolve the issue and post ``$Command`` again.`n`nIf you have questions, post a message to https://aka.ms/tcphelp."
 
                         Write-Host "PR #$PrNumber mergeable_state is `"$MergeableState`". Rejecting $Command."
                         Add-PrComment -IssueUrl $IssueUrl -Body $RejectionBody
@@ -1357,16 +1452,6 @@ jobs:
 
                 }
 
-                # Apply the OnDemandPublish label to mark this PR as on-demand publishing activity (PubOps
-                # visibility). Ensure the label exists on the repo first.
-                If (!(Test-RepoLabel -RepoUri $RepoLabelUrl -Name $OnDemandLabel)) {
-
-                    New-RepoLabel -RepoUri $RepoLabelUrl -Name $OnDemandLabel -Color $OnDemandLabelColor -Description $OnDemandLabelDescription
-
-                }
-
-                Set-PrLabel -IssueUrl $IssueUrl -LabelName $OnDemandLabel
-
                 If (!$PrData.merged) {
 
                     # Merge the PR directly via the REST API using the App token. The partner doesn't have direct merge
@@ -1375,28 +1460,54 @@ jobs:
 
                     If (!$MergeResult.Success) {
 
-                        $MergeFailedBody = "${MentionPrefix}We couldn't merge this pull request, so publishing wasn't triggered.`n`n**GitHub reported**: $($MergeResult.ErrorMessage)`n`nIf you have questions, post a message to https://aka.ms/tcphelp."
+                        $MergeFailedSuffix = If ($Command -eq $PublishCommand) { ", so publishing wasn't triggered" } Else { "" }
+                        $MergeFailedBody = "${MentionPrefix}We couldn't merge this pull request$MergeFailedSuffix.`n`n**GitHub reported**: $($MergeResult.ErrorMessage)`n`nIf you have questions, post a message to https://aka.ms/tcphelp."
                         Add-PrComment -IssueUrl $IssueUrl -Body $MergeFailedBody
                         $ActionTaken = "Failed to merge via ``$Command`` command. GitHub: $($MergeResult.ErrorMessage)."
-                        Record-TrackingActivity -Action $ActionTaken -Scenario $Scenario
+                        Record-TrackingActivity -Action $ActionTaken -Scenario $Scenario -CreateIfMissing:($MergedByCommand -and !$IsReleaseBranchPr)
                         Return
 
                     }
 
                     $MergedByCommand = $True
 
+                    # Labels record what actually happened, so this is applied only after the merge succeeds. Both
+                    # commands can merge, so both can apply it.
+                    Add-OnDemandLabel -Name $OnDemandMergeLabel -Color $OnDemandMergeLabelColor -Description $OnDemandMergeLabelDescription
+
                 }
 
-                # Release-branch PRs stop here: the merge is the whole operation. AutoPublish publishes the default branch
-                # to live, so dispatching it now would publish unrelated content rather than this PR's changes.
-                If ($IsReleaseBranchPr) {
+                # "#trusted-merge" stops here - the merge is the whole operation, and AutoPublish is never dispatched.
+                # On the default branch the merged content still publishes on the next scheduled AutoPublish run, so the
+                # response says so and offers "#trusted-publish" for anyone who needs it live sooner. On a release branch
+                # nothing publishes until the release branch itself ships.
+                If ($Command -eq $MergeCommand) {
 
-                    Write-Host "PR #$PrNumber merged into release branch `"$BaseRef`" via $Command. Skipping AutoPublish."
+                    Write-Host "PR #$PrNumber merged into `"$BaseRef`" via $MergeCommand. AutoPublish not dispatched (merge-only command)."
 
-                    $ReleaseMergeBody = "${MentionPrefix}We've merged this pull request into the ``$BaseRef`` branch.`n`nAutoPublish only publishes the ``$DefaultBranch`` branch to ``$TargetBranch``, so we haven't triggered it. These changes go live when the ``$BaseRef`` release branch ships.`n`nIf you have questions, post a message to https://aka.ms/tcphelp."
-                    Add-PrComment -IssueUrl $IssueUrl -Body $ReleaseMergeBody
-                    $ActionTaken = "Merged into release branch ``$BaseRef`` via ``$Command`` command. ``$OnDemandLabel`` label applied; AutoPublish not triggered (release branch)."
-                    Record-TrackingActivity -Action $ActionTaken -Scenario $Scenario
+                    $MergeOnlyBody = If ($IsReleaseBranchPr) {
+
+                        "${MentionPrefix}We've merged this pull request into the ``$BaseRef`` branch.`n`nAutoPublish only publishes the ``$DefaultBranch`` branch to ``$TargetBranch``, so we haven't triggered it. These changes go live when the ``$BaseRef`` release branch ships.`n`nIf you have questions, post a message to https://aka.ms/tcphelp."
+
+                    } Else {
+
+                        $MergedOnlyResponse
+
+                    }
+
+                    Add-PrComment -IssueUrl $IssueUrl -Body $MergeOnlyBody
+
+                    $ActionTaken = If ($IsReleaseBranchPr) {
+
+                        "Merged into release branch ``$BaseRef`` via ``$MergeCommand`` command. ``$OnDemandMergeLabel`` label applied; AutoPublish not triggered (release branch)."
+
+                    } Else {
+
+                        "Merged via ``$MergeCommand`` command. ``$OnDemandMergeLabel`` label applied; AutoPublish not triggered (merge-only command)."
+
+                    }
+
+                    Record-TrackingActivity -Action $ActionTaken -Scenario $Scenario -CreateIfMissing:($MergedByCommand -and !$IsReleaseBranchPr)
                     Return
 
                 }
@@ -1410,10 +1521,13 @@ jobs:
 
                 If ($Triggered) {
 
+                    # The publish label records that AutoPublish was actually dispatched, so it's applied only here.
+                    Add-OnDemandLabel -Name $OnDemandLabel -Color $OnDemandLabelColor -Description $OnDemandLabelDescription
+
                     If ($MergedByCommand) {
 
                         Add-PrComment -IssueUrl $IssueUrl -Body $MergeSucceededResponse
-                        $ActionTaken = "Merged via ``$Command`` command. ``$OnDemandLabel`` label applied; AutoPublish triggered automatically."
+                        $ActionTaken = "Merged via ``$Command`` command. ``$OnDemandMergeLabel`` and ``$OnDemandLabel`` labels applied; AutoPublish triggered automatically."
 
                     } Else {
 
@@ -1428,15 +1542,18 @@ jobs:
 
                         $TriggerFailedBody = "${MentionPrefix}We've merged this pull request, but we couldn't trigger AutoPublish automatically. Post ``$PublishCommand`` on this PR to retry, or wait for the next scheduled publish run.`n`nIf you have questions, post a message to https://aka.ms/tcphelp."
                         Add-PrComment -IssueUrl $IssueUrl -Body $TriggerFailedBody
-                        $ActionTaken = "Merged via ``$Command`` command. ``$OnDemandLabel`` label applied; failed to trigger AutoPublish. Repost ``$PublishCommand`` to retry."
+                        $ActionTaken = "Merged via ``$Command`` command. ``$OnDemandMergeLabel`` label applied; failed to trigger AutoPublish, so no ``$OnDemandLabel`` label. Repost ``$PublishCommand`` to retry."
 
                     } Else {
 
                         Add-PrComment -IssueUrl $IssueUrl -Body $PublishFailedResponse
-                        $ActionTaken = "Failed to trigger AutoPublish workflow via ``$Command`` command on an already-merged PR. ``$OnDemandLabel`` label applied."
+                        $ActionTaken = "Failed to trigger AutoPublish workflow via ``$Command`` command on an already-merged PR. No labels applied."
 
                     }
 
                 }
 
-                Record-TrackingActivity -Action $ActionTaken -Scenario $Scenario
+                # A new tracking issue is created only when this run merged content into the default branch - that merge
+                # is the PubOps review gate. Otherwise this appends to an open issue if one exists, or records nothing.
+                # (This path is default-branch only: #trusted-publish is rejected on release branches.)
+                Record-TrackingActivity -Action $ActionTaken -Scenario $Scenario -CreateIfMissing:($MergedByCommand -and !$IsReleaseBranchPr)
