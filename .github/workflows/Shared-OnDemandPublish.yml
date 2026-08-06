@@ -19,7 +19,7 @@ on:
                 required: false
                 type: boolean
                 default: false
-            AfterHoursAuthorizedTeam:           # GitHub team slug whose members may issue on-demand publishing commands during after hours - e.g., "windows-afterhours". Synced from CoreIdentity entitlement TCP-GHP-AfterHours-<identifier>. Leave blank to disable the after-hours scenario in this repo.
+            AfterHoursAuthorizedTeam:           # Optional legacy fallback. GitHub team slug whose members may issue on-demand publishing commands during after hours - e.g., "windows-afterhours". Synced from CoreIdentity entitlement TCP-GHP-AfterHours-<identifier>. The primary after-hours gate is triage permission or higher on the repo, so new repos should leave this blank. Use EnableAfterHoursPublish to disable the after-hours scenario in this repo.
                 required: false
                 type: string
                 default: ''
@@ -148,6 +148,8 @@ jobs:
                 # AutoPublish publishes the default branch to live, so it can't publish release-branch content.
                 $ReleaseBranchPattern = "release-*"
                 $RepoLabelUrl = $GitHubData.event.repository.labels_url
+                # Templated collaborators URL from the event payload. Used to look up a submitter's repo permission level.
+                $CollaboratorsUrl = $GitHubData.event.repository.collaborators_url
                 $TrackingRepoLabelUrl = "https://api.github.com/repos/$TrackingRepoOrganization/$TrackingRepoName/labels{/name}"
                 # Separator between the tracking issue's machine-readable title marker and the PR title. Shared by the
                 # issue builder and the lookup so the two can't drift - the lookup depends on it to avoid matching a
@@ -209,7 +211,10 @@ jobs:
                 # After-hours scenario response messages
 
                 $AfterHours_StandardHoursResponse = "${MentionPrefix}After hours self publishing isn't available during standard publishing hours. Add the **Sign off** label to request publishing from PubOps.`n`nIf you have questions, post a message to https://aka.ms/tcphelp."
-                $AfterHours_UnauthorizedHeader = "Only authorized submitters can use after hours self publishing commands."
+                $AfterHours_UnauthorizedHeader = "Only submitters with triage permission or higher can use after hours self publishing commands."
+                # Shown in place of a member list: there's no inexpensive way to enumerate everyone holding triage on a repo,
+                # and the requirement is self-serviceable, so tell the submitter how to obtain access instead.
+                $AfterHours_PermissionGuidance = "You need **Triage** permission or higher on this repository - the same access that lets you sign off a pull request with ``#sign-off``. Ask a repository admin to grant it."
 
                 #####################
                 # Servicing scenario response messages
@@ -401,6 +406,64 @@ jobs:
                     } Catch {
 
                         Write-Host "$Submitter is not a member of team $Organization/$Team, or the lookup failed. Error: $($Error[0].Exception.Message)."
+
+                        Return $False
+
+                    }
+
+                }
+
+                #####################
+                #####################
+                # Test-TriagePermission
+
+                # Returns $True if $Submitter holds triage permission or higher on this repo.
+                #
+                # This mirrors the sign-off gate in Shared-TierManagement.yml: whoever can sign a pull request off can also
+                # publish it after hours, so both paths share a single trust boundary and no separate entitlement has to be
+                # provisioned per repo.
+                #
+                # Reads .role_name rather than .permission - .permission returns only legacy values (admin/write/read) and
+                # can't distinguish triage from read. Custom roles derived from write (for example "write-elevated") are
+                # caught by the "write*" wildcard. Non-collaborators come back as "read" on public repos, so they fail here.
+                #
+                # Fails closed: any lookup error returns $False.
+                Function Test-TriagePermission {
+
+                    [CmdletBinding()]
+                    param(
+
+                        $Submitter
+
+                    )
+
+                    If ([string]::IsNullOrWhiteSpace($Submitter)) {
+
+                        Return $False
+
+                    }
+
+                    $PermissionUri = $CollaboratorsUrl.Replace("{/collaborator}", "/$Submitter/permission")
+
+                    Try {
+
+                        Write-Host "Checking the repo permission level for $Submitter."
+
+                        $UserPermission = $(Invoke-RestMethod -Uri $PermissionUri -Headers $AppGitHubAccessHeaders -Method Get -ErrorAction Stop).role_name
+
+                        Write-Host "User $Submitter permission level: $UserPermission."
+
+                        If (($UserPermission -like "write*") -or ($UserPermission -eq "maintain") -or ($UserPermission -eq "triage") -or ($UserPermission -eq "admin")) {
+
+                            Return $True
+
+                        }
+
+                        Return $False
+
+                    } Catch {
+
+                        Write-Host "Failed to retrieve the permission level for $Submitter. Treating as unauthorized. Error: $($_.Exception.Message)."
 
                         Return $False
 
@@ -1124,8 +1187,10 @@ jobs:
                 #####################
                 # Build-UnauthorizedResponse
 
-                # Builds the unauthorized rejection message. Lists the configured team(s) the submitter could request access to,
-                # tailored to which scenario(s) apply on this repo. Empty/unconfigured sections are omitted entirely.
+                # Builds the unauthorized rejection message, tailored to which scenario(s) apply on this repo. The after-hours
+                # path is gated on repo permission, so it contributes guidance rather than a member list - there's no
+                # inexpensive way to enumerate everyone holding triage. The servicing path stays entitlement-based and still
+                # lists its team. Empty/unconfigured sections are omitted entirely.
                 Function Build-UnauthorizedResponse {
 
                     [CmdletBinding()]
@@ -1141,33 +1206,42 @@ jobs:
 
                     $Sections = @()
                     $Header = ""
+                    $Footer = ""
 
                     If ($ScenarioInContext -eq $ScenarioServicing) {
 
                         $Header = $Servicing_UnauthorizedHeader
 
-                        $AhSection = Format-MemberSection -SectionLabel "After-hours authorized accounts:" -Team $AfterHoursAuthorizedTeam
+                        $AhSection = "**After hours publishing:**`n$AfterHours_PermissionGuidance"
+                        $AhTeamSection = Format-MemberSection -SectionLabel "After-hours authorized accounts:" -Team $AfterHoursAuthorizedTeam
                         $SvcSection = Format-MemberSection -SectionLabel "Servicing authorized accounts:" -Team $ServicingAuthorizedTeam
                         $AppsSection = Format-AppsSection -SectionLabel "Servicing authorized apps:" -AuthorizedApps $ServicingAuthorizedApps
 
-                        If ($AhSection) { $Sections += $AhSection }
+                        If ($AfterHoursEnabled) { $Sections += $AhSection }
+                        If ($AhTeamSection) { $Sections += $AhTeamSection }
                         If ($SvcSection) { $Sections += $SvcSection }
                         If ($AppsSection) { $Sections += $AppsSection }
+
+                        $Footer = "Servicing submitters are managed via CoreIdentity entitlements."
 
                     } Else {
 
                         # AfterHours scenario context (or no scenario - default to after-hours framing for non-servicing repos).
                         $Header = $AfterHours_UnauthorizedHeader
 
-                        $AhSection = Format-MemberSection -SectionLabel "After-hours authorized accounts:" -Team $AfterHoursAuthorizedTeam
+                        $Sections += $AfterHours_PermissionGuidance
 
-                        If ($AhSection) { $Sections += $AhSection }
+                        # Only shown on repos that still configure a legacy team.
+                        $AhTeamSection = Format-MemberSection -SectionLabel "These accounts are also authorized:" -Team $AfterHoursAuthorizedTeam
+
+                        If ($AhTeamSection) { $Sections += $AhTeamSection }
 
                     }
 
                     $SectionsBlock = If ($Sections.Count -gt 0) { ($Sections -join "`n`n") } Else { "_(no authorized submitters are currently configured)_" }
+                    $FooterBlock = If ($Footer) { "$Footer`n`n" } Else { "" }
 
-                    Return "${MentionPrefix}$Header`n`n$SectionsBlock`n`nAuthorized submitters are managed via CoreIdentity entitlements.`n`nIf you have questions, post a message to https://aka.ms/tcphelp."
+                    Return "${MentionPrefix}$Header`n`n$SectionsBlock`n`n${FooterBlock}If you have questions, post a message to https://aka.ms/tcphelp."
 
                 }
 
@@ -1266,7 +1340,16 @@ jobs:
 
                 If ($AfterHoursEnabled -and !$IsBotSubmitter) {
 
-                    $AfterHoursAuthorized = Test-AuthorizedSubmitter -Submitter $Submitter -Team $AfterHoursAuthorizedTeam
+                    # Primary gate: triage or higher on this repo - the same permission that lets a submitter sign a PR off.
+                    $AfterHoursAuthorized = Test-TriagePermission -Submitter $Submitter
+
+                    # Legacy fallback: the CoreIdentity-synced team, for repos that still configure one. Skipped entirely
+                    # when AfterHoursAuthorizedTeam is blank, which is the expected state for new repos.
+                    If (!$AfterHoursAuthorized -and ![string]::IsNullOrWhiteSpace($AfterHoursAuthorizedTeam)) {
+
+                        $AfterHoursAuthorized = Test-AuthorizedSubmitter -Submitter $Submitter -Team $AfterHoursAuthorizedTeam
+
+                    }
 
                 }
 

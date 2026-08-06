@@ -58,6 +58,8 @@ jobs:
           sparse-checkout-cone-mode: false
 
       # Read the repo's on-demand publishing configuration. Command detection and validation live in the shared workflow.
+      # AfterHoursAuthorizedTeam is an optional legacy fallback - after-hours access is granted by triage permission or
+      # higher on the repo, so the key can be omitted entirely (it resolves to an empty string, and the team check is skipped).
       - id: read
         shell: pwsh
         run: |
