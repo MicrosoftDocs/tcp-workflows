@@ -60,7 +60,7 @@ jobs:
       # it out is safe. persist-credentials: false keeps the privileged token out of
       # .git/config; all analysis below is local git reads that need no credentials.
       - name: Checkout base (trusted)
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.base_ref }}
           fetch-depth: 0
@@ -73,7 +73,7 @@ jobs:
       # materialized). persist-credentials: false drops the token after checkout so the
       # data-reading steps below cannot use it.
       - name: Check out PR head (untrusted, data only)
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.pull_request.head.sha }}
           path: pr-head
@@ -88,7 +88,7 @@ jobs:
       # No file CONTENT is fetched here; the content comes from the PR-head checkout above.
       # Files under /includes/ are ignored throughout.
       - name: Build manifest of changed .md files
-        uses: actions/github-script@v8
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
         with:
           github-token: ${{ secrets.AccessToken }}
           script: |
@@ -488,7 +488,7 @@ jobs:
 
       - name: Post inline kb_id comments
         if: always()
-        uses: actions/github-script@v8
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
         with:
           github-token: ${{ secrets.AccessToken }}
           script: |
